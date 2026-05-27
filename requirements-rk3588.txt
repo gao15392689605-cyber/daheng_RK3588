@@ -1,0 +1,8 @@
+# 烟草异物智能检测系统 — RK3588 增量依赖清单
+#
+# 适用场景: 复用 ~/gaoyifan_yolo_rknn/RK3588_部署/venv 已有虚拟环境
+# 该 venv 已预装: numpy / opencv (含 headless) / shapely / Pillow /
+#                rknn-toolkit-lite2 / gxipy (大恒相机 SDK)
+# 本文件仅列出本项目额外需要的包 (主要是 PySide6 GUI)
+
+PySide6==6.6.1

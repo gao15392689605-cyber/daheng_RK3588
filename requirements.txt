@@ -1,0 +1,21 @@
+# 烟草异物智能检测系统 — 完整依赖清单 (全新环境部署)
+# Python 3.10+
+
+# GUI
+PySide6==6.6.1
+
+# 推理后端 (RK3588 NPU — 仅 ARM64 Linux 可装)
+rknn-toolkit-lite2==2.0.0; platform_machine == "aarch64" and sys_platform == "linux"
+
+# 图像与数值
+numpy>=1.24.0,<2.0
+opencv-python-headless==4.9.0.80
+Pillow>=10.0.0
+shapely>=2.0.0
+
+# 大恒工业相机 SDK (现场设备预装, 无 PyPI 包, 安装时跳过)
+# gxipy  — 工厂提供的 wheel, 手工安装
+
+# 备注:
+# - rknn-toolkit-lite2 在 x86 / Windows 无 wheel; 开发机可省略 (回退 PT 模式需 torch+ultralytics)
+# - 本工程不引入: matplotlib / pandas / scikit-learn / pytest / 完整 ultralytics

@@ -1,0 +1,64 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# 虚拟环境
+venv/
+env/
+ENV/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# 数据库 (含用户密码哈希, 不能上传)
+db/*.db
+db/*.db-journal
+
+# 日志 (本地运行产物)
+logs/
+
+# 模型权重 (大文件 + 资产归属)
+# 如果你想传, 删掉这行并改用 git lfs track "*.rknn"
+model/*.rknn
+model/*.pt
+model/*.onnx
+
+# 符号链接 (运行时自动建)
+模型权重
+
+# 字体 (5MB, 大文件)
+# 如果要传, 删掉这行
+resources/fonts/*.ttc
+resources/fonts/*.ttf
+
+# 测试导出目录
+detection_*/
+
+# 临时文件
+*.tmp
+*.bak
+*.tar.gz
