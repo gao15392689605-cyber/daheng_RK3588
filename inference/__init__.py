@@ -211,19 +211,7 @@ def _merge_overlap_cv2(boxes, cls_ids, confs):
 
 # 替换 inference 里的两个慢函数
 _core._obb_nms = _obb_nms_cv2
-
-_LAST_BOXES: list[np.ndarray] = []
-
-
-def _merge_capture(boxes, cls_ids, confs):
-    """cv2 版合并 + 顺便缓存 boxes 给 UI 高亮用"""
-    global _LAST_BOXES
-    result = _merge_overlap_cv2(boxes, cls_ids, confs)
-    _LAST_BOXES = result[0]
-    return result
-
-
-_core.merge_same_class_overlap = _merge_capture
+_core.merge_same_class_overlap = _merge_overlap_cv2
 
 
 # ════════════════════════════════════════════════════════════
@@ -327,69 +315,6 @@ def _rknn_predict_obb_fast(gray_hw1, conf_th, iou_th):
 _core._rknn_predict_obb = _rknn_predict_obb_fast
 
 
-# ════════════════════════════════════════════════════════════
-# 流式快速模式: monkey-patch draw_annotations
-# 视频/相机模式下跳过 PIL 中文标签 (省 30-80ms/帧), 只用 cv2 画彩色框
-# ════════════════════════════════════════════════════════════
-_FAST_MODE: bool = False
-_orig_draw = _core.draw_annotations
-
-
-def _draw_fast(img_bgr, boxes, cls_names_eng, confs, sizes):
-    """cv2 极简画框 — 跳过 PIL 中文 textbbox 渲染"""
-    import cv2
-    out = img_bgr.copy()
-    h, w = img_bgr.shape[:2]
-    short_edge = min(h, w)
-    thick = max(2, short_edge // 600)
-    for box, eng, sz in zip(boxes, cls_names_eng, sizes):
-        color = _core.CLASS_COLORS_BGR.get(eng, (0, 255, 0))
-        pts = np.asarray(box).astype(np.int32)
-        cv2.polylines(out, [pts], isClosed=True, color=color,
-                      thickness=thick + (1 if sz > 1 else 0))
-    return out
-
-
-# 类别过滤 — 中文类名集合, 空 = 全部允许
-_ENABLED_CLASSES_CN: set = set()
-
-
-def set_enabled_classes(cn_set) -> None:
-    """切换允许显示的类别 (中文名集合, 空集 = 全部)"""
-    global _ENABLED_CLASSES_CN
-    _ENABLED_CLASSES_CN = set(cn_set) if cn_set else set()
-
-
-def _filter_by_enabled(boxes, cls_names_eng, confs, sizes):
-    """按 _ENABLED_CLASSES_CN 过滤画框输入"""
-    enabled = _ENABLED_CLASSES_CN
-    if not enabled:
-        return boxes, cls_names_eng, confs, sizes
-    keep = [i for i, eng in enumerate(cls_names_eng)
-            if _core.CN_NAMES.get(eng, eng) in enabled]
-    return ([boxes[i] for i in keep],
-            [cls_names_eng[i] for i in keep],
-            [confs[i] for i in keep],
-            [sizes[i] for i in keep])
-
-
-def _draw_dispatch(img_bgr, boxes, cls_names_eng, confs, sizes):
-    # 类别过滤 — 过滤掉的不再画框
-    boxes, cls_names_eng, confs, sizes = _filter_by_enabled(boxes, cls_names_eng, confs, sizes)
-    if _FAST_MODE:
-        return _draw_fast(img_bgr, boxes, cls_names_eng, confs, sizes)
-    return _orig_draw(img_bgr, boxes, cls_names_eng, confs, sizes)
-
-
-_core.draw_annotations = _draw_dispatch
-
-
-def set_fast_mode(enabled: bool) -> None:
-    """切换快速模式: True=cv2 画框(快), False=PIL 中文标签(美)"""
-    global _FAST_MODE
-    _FAST_MODE = bool(enabled)
-
-
 def run_inference_runtime(
     image_rgb: np.ndarray,
     conf_th: float,
@@ -421,7 +346,7 @@ def paint_annotations(image_rgb: np.ndarray, detections: list[dict[str, Any]]) -
     cls_names_eng = [d.get("class_eng", "") for d in detections]
     confs = [float(d.get("conf", d.get("confidence", 0.0))) for d in detections]
     sizes = [int(d.get("merged", 1)) for d in detections]
-    annotated_bgr = _orig_draw(img_bgr, boxes, cls_names_eng, confs, sizes)
+    annotated_bgr = _core.draw_annotations(img_bgr, boxes, cls_names_eng, confs, sizes)
     return cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
 
 

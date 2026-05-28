@@ -10,7 +10,7 @@ import cv2
 import numpy as np
 from PySide6.QtCore import QObject, QThread, Signal
 
-from utils.common import ensure_dir, get_logger, now_ts
+from utils.common import ensure_dir, get_logger
 
 log = get_logger("exporter")
 
@@ -44,24 +44,6 @@ class Exporter(QObject):
         session = ensure_dir(Path(out_dir) / f"detection_{stamp}")
         return session
 
-    @staticmethod
-    def export_all(
-        out_dir: str | Path,
-        username: str,
-        results: list[dict[str, Any]],
-        annotated_rgb: np.ndarray | None,
-        meta: dict[str, Any] | None = None,
-    ) -> tuple[bool, str]:
-        try:
-            session = Exporter.make_session_dir(out_dir)
-            Exporter._write_csv(session / "result.csv", results)
-            Exporter._write_image(session / "annotated.jpg", annotated_rgb)
-            log.info("导出成功: %s", session)
-            return True, str(session)
-        except Exception as e:
-            log.error("导出失败: %s", e)
-            return False, str(e)
-
 
 class ExportWorker(QThread):
     """后台导出线程 — 大批量场景用"""
@@ -73,18 +55,14 @@ class ExportWorker(QThread):
     def __init__(
         self,
         out_dir: str,
-        username: str,
         results: list[dict[str, Any]],
         annotated_rgb: np.ndarray | None,
-        meta: dict[str, Any] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.out_dir = out_dir
-        self.username = username
         self.results = results
         self.annotated_rgb = annotated_rgb
-        self.meta = meta
 
     def run(self) -> None:
         try:

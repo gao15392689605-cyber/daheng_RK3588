@@ -93,7 +93,3 @@ def list_media_files(folder: str | Path, recursive: bool = False) -> list[Path]:
         if p.is_file() and (is_image_file(p) or is_video_file(p)):
             out.append(p)
     return sorted(out)
-
-
-def now_ts() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")

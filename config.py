@@ -41,7 +41,6 @@ MODE_PHOTO: str = "photo"
 MODE_VIDEO: str = "video"
 MODE_FOLDER: str = "folder"
 MODE_CAMERA: str = "camera"
-MODE_CAMERA_SNAP: str = "camera_snap"
 
 # ── 10 类异物中文名(与 inference.CN_NAMES 同步, 供 UI 选择列表用) ──
 CLASS_LIST_CN: tuple[str, ...] = (

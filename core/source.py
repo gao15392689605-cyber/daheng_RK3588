@@ -138,35 +138,3 @@ class CameraSource(BaseSource):
 
     def info(self) -> str:
         return self.cm.info()
-
-
-class CameraSnapSource(BaseSource):
-    """相机抓拍 — 只读 1 帧, 行为同单图"""
-
-    def __init__(self, camera_manager: Any) -> None:
-        self.cm = camera_manager
-        self.total = 1
-        self._taken = False
-
-    def open(self) -> bool:
-        return self.cm.open()
-
-    def read(self) -> tuple[bool, np.ndarray | None]:
-        if self._taken:
-            return False, None
-        # 等待相机出一帧 (最多 3 次尝试)
-        for _ in range(3):
-            ok, frame = self.cm.read()
-            if ok and frame is not None:
-                self._taken = True
-                return True, frame
-            import time as _t
-            _t.sleep(0.05)
-        return False, None
-
-    def close(self) -> None:
-        # 不彻底关相机, 只停流, 下次 open 快速 stream_on
-        self.cm.close()
-
-    def info(self) -> str:
-        return f"相机抓拍 - {self.cm.info()}"

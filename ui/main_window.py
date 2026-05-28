@@ -232,15 +232,9 @@ class MainWindow(LayoutMixin, QMainWindow):
                 QMessageBox.warning(self, "提示", "请先在左侧选择检测模式")
             return
         self.worker = FolderBatchWorker(source) if use_batch else DetectionWorker(source)
-        # 视频跳帧 + 流式快速模式(跳 PIL 中文标签)
-        from inference import set_fast_mode
+        # 视频跳帧: 每 3 帧推理 1 次, 减轻流式负载 (检测框由 UI ObbOverlay 渲染)
         if mode == MODE_VIDEO:
             self.worker.frame_skip = 2
-            set_fast_mode(True)
-        elif mode == MODE_CAMERA:
-            set_fast_mode(True)
-        else:
-            set_fast_mode(False)  # 单图/文件夹保留中文标签
         self._current_file_path = file_path
         self._all_results.clear()
         self.table.clear_all()
@@ -390,10 +384,7 @@ class MainWindow(LayoutMixin, QMainWindow):
     def _on_filter_changed(self, enabled: set[str]) -> None:
         # 空集 = 全部
         state.filter_classes = enabled if len(enabled) < len(CLASS_LIST_CN) else set()
-        # 让 inference draw 层也按过滤画图(下一帧生效, 单图模式需重新点开始)
-        from inference import set_enabled_classes
-        set_enabled_classes(state.filter_classes)
-        # 立刻把过滤套用到当前帧 — 不等下一帧
+        # 过滤即时套用到当前帧 — UI 端 ObbOverlay 重画, 不等下一帧
         self._apply_filter_now()
 
     def _on_export(self) -> None:
@@ -406,14 +397,6 @@ class MainWindow(LayoutMixin, QMainWindow):
         )
         if not d:
             return
-        meta = {
-            "username": state.username,
-            "detect_mode": state.detect_mode,
-            "file_path": self._current_file_path,
-            "conf": state.conf_threshold,
-            "iou": state.iou_threshold,
-            "model": state.model_name,
-        }
         # 导出带框图: skip_draw 模式下 last_annotated_rgb 是原图, 这里调 paint_annotations 重新画
         from inference import paint_annotations
         export_img = state.last_annotated_rgb
@@ -422,10 +405,7 @@ class MainWindow(LayoutMixin, QMainWindow):
                 export_img = paint_annotations(export_img, state.current_results)
             except Exception as e:
                 log.error("导出画框失败, 使用原图: %s", e)
-        self._export_worker = ExportWorker(
-            d, state.username, state.current_results,
-            export_img, meta,
-        )
+        self._export_worker = ExportWorker(d, state.current_results, export_img)
         ew = self._export_worker
         ew.progress.connect(lambda c, t: (
             self.export_progress.setRange(0, max(1, t)),

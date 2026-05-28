@@ -221,15 +221,6 @@ class ResultTable(QTableWidget):
                 coord = "—"
             self.setItem(row, 4, QTableWidgetItem(coord))
 
-    def append_row(self, file_path: str, idx: int, d: dict[str, Any]) -> None:
-        row = self.rowCount()
-        self.insertRow(row)
-        self.setItem(row, 0, QTableWidgetItem(str(idx)))
-        self.setItem(row, 1, QTableWidgetItem(file_path))
-        self.setItem(row, 2, QTableWidgetItem(d.get("class_name", "")))
-        self.setItem(row, 3, QTableWidgetItem(f"{d.get('confidence', 0.0):.3f}"))
-        self.setItem(row, 4, QTableWidgetItem(f"merged×{d.get('merged', 1)}"))
-
     def clear_all(self) -> None:
         self.setRowCount(0)
 
