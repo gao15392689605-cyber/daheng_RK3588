@@ -7,7 +7,7 @@ from __future__ import annotations
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor, QPalette, QPixmap
 from PySide6.QtWidgets import (
-    QAbstractItemView, QDialog, QFormLayout, QHBoxLayout, QHeaderView,
+    QAbstractItemView, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QSlider,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -306,3 +306,112 @@ class ProfilePanel(QWidget):
                 return
         self.avatar.setPixmap(QPixmap())
         self.avatar.setText(name[:1].upper() if name else "?")
+
+
+class DetectionSummaryDialog(QDialog):
+    """本次会话检测总计 — 各类"单帧最多同时出现"峰值 + 总计, 可保存 CSV
+
+    口径: peak[类别] = 整段会话里该类在单帧中出现过的最大数量 (非逐帧累加).
+    """
+
+    _MODE_CN = {"photo": "照片", "video": "视频", "folder": "文件夹批量", "camera": "工业相机"}
+
+    def __init__(self, mode: str, peak: dict[str, int], parent=None) -> None:
+        super().__init__(parent)
+        self._peak = {k: v for k, v in peak.items() if v > 0}
+        self._mode_cn = self._MODE_CN.get(mode, mode)
+        self.setWindowTitle("本次检测总计")
+        self.resize(420, 460)
+        self.setStyleSheet(f"background:{COLOR_BG_MAIN}; color:{COLOR_TEXT};")
+        self._build()
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 16, 18, 16)
+        lay.setSpacing(10)
+
+        title = QLabel(f"本次检测总计 — {self._mode_cn}")
+        title.setStyleSheet(f"color:{COLOR_TEXT}; font-size:16px; font-weight:bold;")
+        lay.addWidget(title)
+
+        sub = QLabel(f"共检测到异物 {sum(self._peak.values())} 个（按单帧最多同时出现计）")
+        sub.setStyleSheet(f"color:{COLOR_BTN_PRIMARY}; font-size:13px;")
+        sub.setWordWrap(True)
+        lay.addWidget(sub)
+
+        if not self._peak:
+            empty = QLabel("本次未检测到异物")
+            empty.setAlignment(Qt.AlignCenter)
+            empty.setStyleSheet(f"color:{COLOR_TEXT_DIM}; padding:40px; font-size:14px;")
+            lay.addWidget(empty, 1)
+        else:
+            table = QTableWidget()
+            table.setColumnCount(2)
+            table.setHorizontalHeaderLabels(["类别", "最多同时数量"])
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.setSelectionMode(QAbstractItemView.NoSelection)
+            table.setAlternatingRowColors(False)
+            table.verticalHeader().setVisible(False)
+            table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeToContents)
+            table.setStyleSheet(
+                f"QTableWidget {{ background:{COLOR_BG_MAIN}; color:{COLOR_TEXT};"
+                f"gridline-color:{COLOR_BORDER}; }}"
+                f"QTableWidget::item {{ background:{COLOR_BG_MAIN}; color:{COLOR_TEXT}; padding:6px; }}"
+                f"QHeaderView::section {{ background:{COLOR_BG_SIDE}; color:{COLOR_TEXT};"
+                f"padding:6px; border:none; border-right:1px solid {COLOR_BORDER}; }}"
+            )
+            pal = table.palette()
+            pal.setColor(QPalette.Base, QColor(COLOR_BG_MAIN))
+            pal.setColor(QPalette.AlternateBase, QColor(COLOR_BG_MAIN))
+            pal.setColor(QPalette.Text, QColor(COLOR_TEXT))
+            table.setPalette(pal)
+            rows = sorted(self._peak.items(), key=lambda kv: -kv[1])
+            table.setRowCount(len(rows))
+            for i, (cls, n) in enumerate(rows):
+                table.setItem(i, 0, QTableWidgetItem(cls))
+                table.setItem(i, 1, QTableWidgetItem(str(n)))
+            lay.addWidget(table, 1)
+
+        btn_bar = QHBoxLayout()
+        save_btn = QPushButton("💾 保存结果")
+        save_btn.setMinimumHeight(36)
+        save_btn.setStyleSheet(
+            f"QPushButton {{ background:{COLOR_BTN_PRIMARY}; color:white; border:none;"
+            f"border-radius:4px; padding:6px 16px; font-weight:bold; }}"
+            f"QPushButton:hover {{ background:#3E9CFF; }}"
+        )
+        save_btn.clicked.connect(self._on_save)
+        close_btn = QPushButton("关闭")
+        close_btn.setMinimumHeight(36)
+        close_btn.setStyleSheet(
+            f"QPushButton {{ background:{COLOR_BG_SIDE}; color:{COLOR_TEXT};"
+            f"border:1px solid {COLOR_BORDER}; border-radius:4px; padding:6px 16px; }}"
+            f"QPushButton:hover {{ background:{COLOR_BTN_PRIMARY}; color:white; }}"
+        )
+        close_btn.clicked.connect(self.accept)
+        btn_bar.addWidget(save_btn)
+        btn_bar.addStretch()
+        btn_bar.addWidget(close_btn)
+        lay.addLayout(btn_bar)
+
+    def _on_save(self) -> None:
+        if not self._peak:
+            QMessageBox.information(self, "提示", "本次无检测结果可保存")
+            return
+        import csv
+        import time
+        default = f"检测总计_{self._mode_cn}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
+        fp, _ = QFileDialog.getSaveFileName(self, "保存总计结果", default, "CSV (*.csv)")
+        if not fp:
+            return
+        try:
+            with open(fp, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.writer(f)
+                w.writerow(["类别", "最多同时数量"])
+                for cls, n in sorted(self._peak.items(), key=lambda kv: -kv[1]):
+                    w.writerow([cls, n])
+                w.writerow(["总计", sum(self._peak.values())])
+            QMessageBox.information(self, "已保存", f"总计结果已保存\n{fp}")
+        except Exception as e:
+            QMessageBox.warning(self, "保存失败", str(e))

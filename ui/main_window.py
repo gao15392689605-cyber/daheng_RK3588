@@ -1,9 +1,11 @@
 """主窗口 — 1600×900 四栏布局 + 模式切换"""
 from __future__ import annotations
 
+from collections import Counter
 from pathlib import Path
 from typing import Any
 
+import cv2
 import numpy as np
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
@@ -21,7 +23,7 @@ from core.source import CameraSource, FolderSource, PhotoSource, VideoSource
 from db.db_helper import DbHelper
 from ui._main_layout import LayoutMixin
 from ui.login_window import EditProfileDialog, RegisterDialog
-from ui.panels import CameraSettingsDialog, HistoryQueryWidget
+from ui.panels import CameraSettingsDialog, DetectionSummaryDialog, HistoryQueryWidget
 from ui.widgets import ndarray_to_pixmap
 from utils.common import get_logger, list_media_files
 
@@ -40,12 +42,17 @@ class MainWindow(LayoutMixin, QMainWindow):
 
         self.worker: DetectionWorker | None = None
         self.camera_mgr = CameraManager()
-        self._all_results: list[dict[str, Any]] = []
         # 当前帧未过滤的完整 detections (过滤变化时直接重应用, 不等下一帧)
         self._last_full_detections: list[dict[str, Any]] = []
         self._current_file_path: str = ""
         self._current_log_id: int = -1
         self._export_worker: ExportWorker | None = None
+        # 本次会话各类"单帧最多同时出现"峰值 (口径见 DetectionSummaryDialog)
+        self._session_peak: Counter = Counter()
+        self._summary_shown: bool = False
+        # 文件夹批量结果缓存 (路径 + 检测), 供跑完后左右翻阅; 不存图, 翻阅时重读省内存
+        self._folder_results: list[dict[str, Any]] = []
+        self._folder_idx: int = 0
 
         self._build()
         self._wire_signals()
@@ -64,6 +71,8 @@ class MainWindow(LayoutMixin, QMainWindow):
         self.table.row_selected.connect(self._on_row_selected)
         self.right_panel.filter_changed.connect(self._on_filter_changed)
         self.right_panel.export_request.connect(self._on_export)
+        self.folder_prev_btn.clicked.connect(lambda: self._show_folder_index(self._folder_idx - 1))
+        self.folder_next_btn.clicked.connect(lambda: self._show_folder_index(self._folder_idx + 1))
 
         for key, btn in self._nav_buttons.items():
             btn.clicked.connect(lambda _=False, k=key: self._on_nav_clicked(k))
@@ -86,10 +95,15 @@ class MainWindow(LayoutMixin, QMainWindow):
         is_cam = (mode == MODE_CAMERA)
         self.capture_btn.setVisible(is_cam)
         self.capture_btn.setEnabled(is_cam)
+        self._set_folder_nav_visible(False)  # 切模式收起文件夹翻阅控件
 
     def _on_nav_clicked(self, key: str) -> None:
-        if key in (MODE_PHOTO, MODE_VIDEO, MODE_FOLDER, MODE_CAMERA):
+        if key in (MODE_PHOTO, MODE_VIDEO, MODE_FOLDER):
+            # 即点即弹: 切模式后立即弹文件/文件夹框, 选完自动开始 (相机除外)
             self._switch_mode(key)
+            self._on_start()
+        elif key == MODE_CAMERA:
+            self._switch_mode(key)  # 相机无文件框, 靠 ▶ 启流
         elif key == "profile":
             state.detect_mode = "profile"
             self.profile_panel.refresh()
@@ -222,9 +236,9 @@ class MainWindow(LayoutMixin, QMainWindow):
         return None, "", False
 
     def _on_start(self) -> None:
+        # 运行中重新选源/重选视频: 先静默停掉旧任务 (不弹总计)
         if self.worker is not None and self.worker.isRunning():
-            QMessageBox.warning(self, "提示", "已有检测任务在运行")
-            return
+            self._stop_worker_silent()
         mode = state.detect_mode
         source, file_path, use_batch = self._pick_source(mode)
         if source is None:
@@ -236,7 +250,12 @@ class MainWindow(LayoutMixin, QMainWindow):
         if mode == MODE_VIDEO:
             self.worker.frame_skip = 2
         self._current_file_path = file_path
-        self._all_results.clear()
+        # 会话级状态清零 — 重选视频/重开摄像头即重新计数
+        self._session_peak = Counter()
+        self._summary_shown = False
+        self._folder_results = []
+        self._folder_idx = 0
+        self._set_folder_nav_visible(False)
         self.table.clear_all()
         self.overlay.clear_all()
 
@@ -255,16 +274,28 @@ class MainWindow(LayoutMixin, QMainWindow):
         self.worker.error.connect(self._on_worker_error)
         self.worker.finished_clean.connect(self._on_worker_finished)
         self.worker.progress.connect(self._on_progress)
+        if use_batch:
+            self.worker.file_finished.connect(self._on_folder_file_done)
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        # 单图模式没必要暂停, 其余模式开放暂停按钮
-        self.pause_btn.setEnabled(mode != MODE_PHOTO)
+        # 暂停只给摄像头 (视频/文件夹跑完看翻阅, 不做暂停)
+        self.pause_btn.setEnabled(mode == MODE_CAMERA)
         self.pause_btn.setChecked(False)
         self.pause_btn.setText("⏸ 暂停")
         self.center_status.setText(f"检测中 — {file_path or '工业相机'}")
         self.worker.start()
         log.info("启动检测: mode=%s, src=%s", mode, file_path)
+
+    def _stop_worker_silent(self) -> None:
+        """停掉当前 worker 并结清审计日志, 但不弹总计 (用于切源/重选)"""
+        if self.worker is None:
+            return
+        self.worker.stop()
+        if not self.worker.wait(1500):
+            self.worker.terminate()
+            self.worker.wait(500)
+        self._finalize_run(status="success")
 
     def _on_pause_toggled(self, paused: bool) -> None:
         if self.worker is None:
@@ -272,10 +303,14 @@ class MainWindow(LayoutMixin, QMainWindow):
         self.worker.set_paused(paused)
         self.pause_btn.setText("▶ 继续" if paused else "⏸ 暂停")
         self.center_status.setText("已暂停" if paused else "检测中")
+        if paused:
+            # 暂停即出累计总计 (峰值不清零, 继续可叠加)
+            self._show_summary_popup()
 
     def _on_stop(self) -> None:
         if self.worker is None:
             return
+        mode = state.detect_mode
         self.worker.stop()
         self.center_status.setText("正在停止...")
         # 兜底: 主动等 worker 最多 1.5s 退出 (read 500ms timeout + 推理时间)
@@ -285,14 +320,30 @@ class MainWindow(LayoutMixin, QMainWindow):
             self.worker.terminate()
             self.worker.wait(500)
         self._finalize_run(status="success")
+        self._maybe_show_summary(mode)
 
     def _on_worker_error(self, msg: str) -> None:
         QMessageBox.warning(self, "检测异常", msg)
         self._finalize_run(status="failed")
 
     def _on_worker_finished(self, reason: str) -> None:
+        mode = state.detect_mode
         self.center_status.setText(f"完成: {reason}")
         self._finalize_run(status="success")
+        self._maybe_show_summary(mode)
+        # 文件夹批量完成 → 启用左右翻阅, 默认停在最后一张
+        if mode == MODE_FOLDER and self._folder_results:
+            self._set_folder_nav_visible(True)
+            self._show_folder_index(len(self._folder_results) - 1)
+
+    def _maybe_show_summary(self, mode: str) -> None:
+        """视频/文件夹/相机 结束或停止时弹一次总计 (照片单图不弹)"""
+        if mode != MODE_PHOTO and not self._summary_shown:
+            self._summary_shown = True
+            self._show_summary_popup()
+
+    def _show_summary_popup(self) -> None:
+        DetectionSummaryDialog(state.detect_mode, dict(self._session_peak), self).exec()
 
     def _finalize_run(self, status: str) -> None:
         self.start_btn.setEnabled(True)
@@ -301,12 +352,11 @@ class MainWindow(LayoutMixin, QMainWindow):
         self.pause_btn.setChecked(False)
         self.pause_btn.setText("⏸ 暂停")
         if self._current_log_id > 0:
-            from collections import Counter
-            summary = Counter(d.get("class_name", "") for d in self._all_results)
+            # 审计日志用会话峰值口径 (与总计弹窗一致, 不再逐帧累加虚高)
             DbHelper.instance().finalize_log(
                 self._current_log_id,
-                total_targets=len(self._all_results),
-                result_summary=dict(summary),
+                total_targets=sum(self._session_peak.values()),
+                result_summary=dict(self._session_peak),
                 status=status,
             )
             self._current_log_id = -1
@@ -322,29 +372,76 @@ class MainWindow(LayoutMixin, QMainWindow):
         detections: list[dict[str, Any]],
         infer_time: float,
     ) -> None:
-        # skip_draw 模式下 annotated_rgb 就是原图; 缓存它给重画 overlay 和导出用
-        state.last_image_rgb = annotated_rgb
-        state.last_annotated_rgb = annotated_rgb  # 兼容老代码
-        state.last_infer_time = infer_time
-        self.infer_time_label.setText(f"🕐 检测耗时  {infer_time*1000:.0f}ms")
+        self._render_frame(annotated_rgb, detections, self._current_file_path, infer_time)
+        # 更新会话峰值: 本帧每类数量与历史峰值取大 (单帧最多同时出现 = 总计口径)
+        frame_counts = Counter(d.get("class_name", "") for d in self._last_full_detections)
+        for cls, n in frame_counts.items():
+            if cls:
+                self._session_peak[cls] = max(self._session_peak[cls], n)
+        log.info("frame_ready: 收到 %d 个检测目标, 耗时 %.0fms", len(detections), infer_time * 1000)
 
+    def _render_frame(
+        self,
+        image_rgb: np.ndarray,
+        full_detections: list[dict[str, Any]],
+        file_path: str,
+        infer_time: float | None = None,
+    ) -> None:
+        """把一帧(图 + 检测)渲染到画布/表格/右侧 — 实时帧与文件夹翻阅共用.
+
+        infer_time=None 表示翻阅缓存结果(不刷耗时标签、不计入峰值).
+        """
+        # skip_draw 模式下 image_rgb 就是原图; 缓存它给重画 overlay 和导出用
+        state.last_image_rgb = image_rgb
+        state.last_annotated_rgb = image_rgb
+        if infer_time is not None:
+            state.last_infer_time = infer_time
+            self.infer_time_label.setText(f"🕐 检测耗时  {infer_time*1000:.0f}ms")
+        self._current_file_path = file_path
         # 首帧到达 — splash 让位给 view
         if self.center_stack.currentIndex() != 1:
             self.center_stack.setCurrentIndex(1)
-        pix = ndarray_to_pixmap(annotated_rgb)
+        pix = ndarray_to_pixmap(image_rgb)
         if self.pix_item is None:
             self.pix_item = self.scene.addPixmap(pix)
         else:
             self.pix_item.setPixmap(pix)
         self.scene.setSceneRect(self.pix_item.boundingRect())
         self._fit_view()
-
-        log.info("frame_ready: 收到 %d 个检测目标, 耗时 %.0fms", len(detections), infer_time * 1000)
-        self._last_full_detections = list(detections)
+        self._last_full_detections = list(full_detections)
         self._apply_filter_now()  # 表格/统计/目标数 + 重画 overlay
-        self._all_results.extend(state.current_results)
-        if state.current_results:
-            self.right_panel.show_detail(state.current_results[0])
+        self.right_panel.show_detail(state.current_results[0] if state.current_results else {})
+
+    def _on_folder_file_done(self, path: str, count: int) -> None:
+        """文件夹批量: 缓存每张图的 路径 + 检测结果, 供跑完后左右翻阅(不存图省内存)"""
+        self._folder_results.append({
+            "path": path,
+            "detections": list(self._last_full_detections),
+        })
+
+    def _set_folder_nav_visible(self, visible: bool) -> None:
+        for w in (self.folder_prev_btn, self.folder_next_btn, self.folder_page_label):
+            w.setVisible(visible)
+
+    def _show_folder_index(self, i: int) -> None:
+        """翻阅文件夹批量结果第 i 张 — 从磁盘重读该图 + 用缓存检测重画框, 不重推理"""
+        n = len(self._folder_results)
+        if n == 0:
+            return
+        i = max(0, min(i, n - 1))
+        self._folder_idx = i
+        r = self._folder_results[i]
+        bgr = cv2.imread(r["path"], cv2.IMREAD_COLOR)
+        if bgr is None:
+            self.center_status.setText(f"无法读取: {r['path']}")
+            return
+        rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        self.view.user_zoomed = False  # 换图重新自适应
+        self._render_frame(rgb, r["detections"], r["path"])
+        self.folder_page_label.setText(f"第 {i+1}/{n} 张 — {Path(r['path']).name}")
+        self.folder_prev_btn.setEnabled(i > 0)
+        self.folder_next_btn.setEnabled(i < n - 1)
+        self.center_status.setText("翻阅模式 — ◀ ▶ 或 ← → 切换")
 
     def _redraw_overlay(self) -> None:
         """根据 state.current_results 重画画布 OBB 框 (UI 自己画, 替代 inference 画框)"""
@@ -460,6 +557,17 @@ class MainWindow(LayoutMixin, QMainWindow):
     def showEvent(self, event) -> None:  # noqa: N802
         super().showEvent(event)
         self._fit_view()
+
+    def keyPressEvent(self, event) -> None:  # noqa: N802
+        # 文件夹翻阅态下 ←/→ 切换上一张/下一张
+        if self.folder_prev_btn.isVisible() and self._folder_results:
+            if event.key() == Qt.Key_Left:
+                self._show_folder_index(self._folder_idx - 1)
+                return
+            if event.key() == Qt.Key_Right:
+                self._show_folder_index(self._folder_idx + 1)
+                return
+        super().keyPressEvent(event)
 
     def closeEvent(self, event) -> None:  # noqa: N802
         """资源清理. 是否退出 app 由 QApplication.quitOnLastWindowClosed 决定 —

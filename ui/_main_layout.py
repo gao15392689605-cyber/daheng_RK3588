@@ -143,6 +143,22 @@ class LayoutMixin:
         status_row = QHBoxLayout(); status_row.setContentsMargins(0, 0, 0, 0)
         self.center_status = QLabel("就绪")
         self.center_status.setStyleSheet(f"color:{COLOR_TEXT_DIM}; padding:4px;")
+
+        # 文件夹结果翻阅控件 (默认隐藏, 文件夹批量完成后才显示)
+        self.folder_prev_btn = QPushButton("◀ 上一张")
+        self.folder_next_btn = QPushButton("下一张 ▶")
+        self.folder_page_label = QLabel("")
+        _nav_qss = (
+            f"QPushButton {{ background:{COLOR_BG_MAIN}; color:{COLOR_TEXT};"
+            f"border:1px solid {COLOR_BORDER}; border-radius:4px; padding:4px 12px; }}"
+            f"QPushButton:hover {{ background:{COLOR_BTN_PRIMARY}; color:white; }}"
+            f"QPushButton:disabled {{ color:{COLOR_TEXT_DIM}; }}"
+        )
+        for b in (self.folder_prev_btn, self.folder_next_btn):
+            b.setStyleSheet(_nav_qss); b.setVisible(False)
+        self.folder_page_label.setStyleSheet(f"color:{COLOR_TEXT}; padding:0 8px;")
+        self.folder_page_label.setVisible(False)
+
         self.export_progress = QProgressBar(); self.export_progress.setFixedWidth(200)
         self.export_progress.setVisible(False)
         self.export_progress.setStyleSheet(
@@ -150,6 +166,9 @@ class LayoutMixin:
             f"border-radius:3px; color:{COLOR_TEXT}; text-align:center; }}"
             f"QProgressBar::chunk {{ background:{COLOR_BTN_PRIMARY}; }}")
         status_row.addWidget(self.center_status, 1)
+        status_row.addWidget(self.folder_prev_btn)
+        status_row.addWidget(self.folder_page_label)
+        status_row.addWidget(self.folder_next_btn)
         status_row.addWidget(self.export_progress)
         lay.addLayout(status_row)
         return wrap
