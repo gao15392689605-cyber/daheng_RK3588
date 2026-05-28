@@ -322,13 +322,7 @@ class MainWindow(LayoutMixin, QMainWindow):
         log.info("启动检测: mode=%s, src=%s", mode, file_path)
 
     def _stop_worker_silent(self) -> None:
-        """停掉当前 worker 并结清审计日志, 但不弹总计 (用于切源/重选)"""
-        if self.worker is None:
-            return
-        self.worker.stop()
-        if not self.worker.wait(1500):
-            self.worker.terminate()
-            self.worker.wait(500)
+        """停掉当前 worker 并结清审计日志, 但不弹总计 (用于切源/重选). 停+等在 _finalize_run 内安全完成."""
         self._finalize_run(status="success")
 
     def _on_pause_toggled(self, paused: bool) -> None:
@@ -345,20 +339,15 @@ class MainWindow(LayoutMixin, QMainWindow):
         if self.worker is None:
             return
         mode = state.detect_mode
-        self.worker.stop()
         self.center_status.setText("正在停止...")
-        # 兜底: 主动等 worker 最多 1.5s 退出 (read 500ms timeout + 推理时间)
-        # 不阻塞太久 UI, 这里同步等是因为 UI 体验"卡一下"比"再开始没反应"好
-        if not self.worker.wait(1500):
-            log.warning("worker 1.5s 未退出, 强制 terminate")
-            self.worker.terminate()
-            self.worker.wait(500)
-        self._finalize_run(status="success")
+        self._finalize_run(status="success")  # 内部安全 stop + wait, 再弹总计
         self._maybe_show_summary(mode)
 
     def _on_worker_error(self, msg: str) -> None:
+        if self.worker is None:
+            return  # 已被处理 (避免排队的多个 error 信号重复弹窗)
+        self._finalize_run(status="failed")  # 先安全停掉 worker, 再提示
         QMessageBox.warning(self, "检测异常", msg)
-        self._finalize_run(status="failed")
 
     def _on_worker_finished(self, reason: str) -> None:
         mode = state.detect_mode
@@ -406,7 +395,19 @@ class MainWindow(LayoutMixin, QMainWindow):
                     "peak": dict(self._session_peak),
                     "total": sum(self._session_peak.values()),
                 })
+        # 安全回收 worker: 必须等线程真正退出再释放引用, 否则
+        # "QThread: Destroyed while thread is still running" 直接 Aborted 崩溃.
+        # 用局部引用持有, 防 wait 期间被 GC.
+        w = self.worker
         self.worker = None
+        if w is not None:
+            try:
+                w.stop()
+                if not w.wait(3000):
+                    w.terminate()
+                    w.wait(500)
+            except Exception as e:
+                log.error("回收 worker 异常: %s", e)
 
     def _on_progress(self, cur: int, total: int) -> None:
         if total > 0:
