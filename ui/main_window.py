@@ -19,7 +19,7 @@ from config import (
 from core.app_state import state
 from core.camera_manager import CameraManager
 from core.detector import DetectionWorker, FolderBatchWorker
-from core.exporter import Exporter, ExportWorker
+from core.exporter import Exporter
 from core.source import CameraSource, FolderSource, PhotoSource, VideoSource
 from db.db_helper import DbHelper
 from ui._main_layout import LayoutMixin
@@ -51,7 +51,6 @@ class MainWindow(LayoutMixin, QMainWindow):
         self._last_full_detections: list[dict[str, Any]] = []
         self._current_file_path: str = ""
         self._current_log_id: int = -1
-        self._export_worker: ExportWorker | None = None
         # 本次会话各类"单帧最多同时出现"峰值 (口径见 DetectionSummaryDialog)
         self._session_peak: Counter = Counter()
         self._summary_shown: bool = False
@@ -338,10 +337,9 @@ class MainWindow(LayoutMixin, QMainWindow):
     def _on_stop(self) -> None:
         if self.worker is None:
             return
-        mode = state.detect_mode
         self.center_status.setText("正在停止...")
         self._finalize_run(status="success")  # 内部安全 stop + wait, 再弹总计
-        self._maybe_show_summary(mode)
+        self._maybe_show_summary()
 
     def _on_worker_error(self, msg: str) -> None:
         if self.worker is None:
@@ -353,15 +351,18 @@ class MainWindow(LayoutMixin, QMainWindow):
         mode = state.detect_mode
         self.center_status.setText(f"完成: {reason}")
         self._finalize_run(status="success")
-        self._maybe_show_summary(mode)
+        self._maybe_show_summary()
         # 文件夹批量完成 → 启用左右翻阅, 默认停在最后一张
         if mode == MODE_FOLDER and self._folder_results:
             self._set_folder_nav_visible(True)
             self._show_folder_index(len(self._folder_results) - 1)
 
-    def _maybe_show_summary(self, mode: str) -> None:
-        """视频/文件夹/相机 结束或停止时弹一次总计 (照片单图不弹)"""
-        if mode != MODE_PHOTO and not self._summary_shown:
+    def _maybe_show_summary(self) -> None:
+        """视频/文件夹/相机 结束或停止时弹一次总计 + 保存入口.
+
+        照片单图不自动弹窗 — 用右侧「结果导出」保存(点击时同样弹 仅汇总/仅明细/两者 选择).
+        """
+        if state.detect_mode != MODE_PHOTO and not self._summary_shown:
             self._summary_shown = True
             self._show_summary_popup()
 
@@ -395,19 +396,25 @@ class MainWindow(LayoutMixin, QMainWindow):
                     "peak": dict(self._session_peak),
                     "total": sum(self._session_peak.values()),
                 })
-        # 安全回收 worker: 必须等线程真正退出再释放引用, 否则
-        # "QThread: Destroyed while thread is still running" 直接 Aborted 崩溃.
-        # 用局部引用持有, 防 wait 期间被 GC.
+        self._dispose_worker()
+
+    def _dispose_worker(self) -> None:
+        """安全停止并释放当前 worker — 等线程真正退出再丢引用, 杜绝
+        "QThread: Destroyed while thread is still running" 导致的 Aborted 崩溃.
+        用局部引用持有, 防 wait 期间被 GC; 超时 terminate 兜底.
+        """
         w = self.worker
         self.worker = None
-        if w is not None:
-            try:
-                w.stop()
-                if not w.wait(3000):
-                    w.terminate()
-                    w.wait(500)
-            except Exception as e:
-                log.error("回收 worker 异常: %s", e)
+        if w is None:
+            return
+        try:
+            w.stop()
+            if not w.wait(3000):
+                log.warning("worker 3s 未退出, 强制 terminate")
+                w.terminate()
+                w.wait(1000)
+        except Exception as e:
+            log.error("回收 worker 异常: %s", e)
 
     def _on_progress(self, cur: int, total: int) -> None:
         if total > 0:
@@ -547,6 +554,7 @@ class MainWindow(LayoutMixin, QMainWindow):
 
         弹 仅汇总/仅明细/两者: 汇总=本次各类峰值 summary.csv;
         明细=当前帧逐条 result.csv + 带框图. 无明细数据时只存汇总.
+        同步写入(数据极小, 毫秒级), 不开线程 — 避免 QThread 回收崩溃.
         """
         if not state.current_results and not self._session_peak:
             QMessageBox.information(self, "提示", "本次无可保存结果")
@@ -560,40 +568,25 @@ class MainWindow(LayoutMixin, QMainWindow):
         )
         if not d:
             return
-        results = state.current_results if kind in ("detail", "both") else None
-        summary = dict(self._session_peak) if kind in ("summary", "both") else None
-        export_img = None
-        if results is not None:
-            # 带框图: skip_draw 模式下 last_annotated_rgb 是原图, 调 paint_annotations 重新画
-            from inference import paint_annotations
-            export_img = state.last_annotated_rgb
-            if export_img is not None and results:
-                try:
-                    export_img = paint_annotations(export_img, results)
-                except Exception as e:
-                    log.error("导出画框失败, 使用原图: %s", e)
-        self._export_worker = ExportWorker(d, results, export_img, summary)
-        ew = self._export_worker
-        ew.progress.connect(lambda c, t: (
-            self.export_progress.setRange(0, max(1, t)),
-            self.export_progress.setValue(c),
-        ))
-        ew.finished_ok.connect(lambda p: (
-            self.export_progress.setVisible(False),
-            QMessageBox.information(self, "导出成功", f"已保存到\n{p}"),
-        ))
-        ew.failed.connect(lambda m: (
-            self.export_progress.setVisible(False),
-            QMessageBox.warning(self, "导出失败", m),
-        ))
-        ew.finished.connect(self._cleanup_export_worker)
-        self.export_progress.setRange(0, 1); self.export_progress.setValue(0)
-        self.export_progress.setVisible(True)
-        self.export_progress.setFormat("导出中... %p%")
-        ew.start()
-
-    def _cleanup_export_worker(self) -> None:
-        self._export_worker = None
+        try:
+            session = Exporter.make_session_dir(d)
+            if kind in ("summary", "both"):
+                Exporter.write_summary_csv(session / "summary.csv", dict(self._session_peak))
+            if kind in ("detail", "both"):
+                Exporter._write_csv(session / "result.csv", state.current_results)
+                # 带框图: skip_draw 模式下 last_annotated_rgb 是原图, 调 paint_annotations 重新画
+                img = state.last_annotated_rgb
+                if img is not None and state.current_results:
+                    from inference import paint_annotations
+                    try:
+                        img = paint_annotations(img, state.current_results)
+                    except Exception as e:
+                        log.error("导出画框失败, 使用原图: %s", e)
+                Exporter._write_image(session / "annotated.jpg", img)
+            QMessageBox.information(self, "保存成功", f"已保存到\n{session}")
+        except Exception as e:
+            log.error("保存失败: %s", e)
+            QMessageBox.warning(self, "保存失败", str(e))
 
     def _open_history(self) -> None:
         HistoryQueryWidget(state.username, self).exec()
@@ -607,9 +600,7 @@ class MainWindow(LayoutMixin, QMainWindow):
         RegisterDialog(self).exec()
 
     def _on_logout(self) -> None:
-        if self.worker is not None and self.worker.isRunning():
-            self.worker.stop()
-            self.worker.wait(2000)
+        self._dispose_worker()  # 安全停掉再注销, 避免线程残留崩溃
         self.logout_requested.emit()
 
     def _fit_view(self) -> None:
@@ -644,9 +635,7 @@ class MainWindow(LayoutMixin, QMainWindow):
         logout 流程会先 show 登录窗再 close 主窗, 此时不是最后一个窗口, 不退出.
         """
         try:
-            if self.worker is not None:
-                self.worker.stop()
-                self.worker.wait(2000)
+            self._dispose_worker()  # 安全停止 + 等线程退出 + terminate 兜底
             # 彻底关闭相机设备 (close_device) 而不仅仅停流
             self.camera_mgr.shutdown()
             self.scene.clear()

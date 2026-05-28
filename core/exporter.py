@@ -8,15 +8,14 @@ from typing import Any
 
 import cv2
 import numpy as np
-from PySide6.QtCore import QObject, QThread, Signal
 
 from utils.common import ensure_dir, get_logger
 
 log = get_logger("exporter")
 
 
-class Exporter(QObject):
-    """每次导出新建独立子文件夹: <out_dir>/detection_YYYYMMDD_HHMMSS/{result.csv, annotated.jpg}"""
+class Exporter:
+    """同步导出工具(纯静态方法). 每次导出新建独立子文件夹 detection_YYYYMMDD_HHMMSS/."""
 
     @staticmethod
     def _write_csv(csv_path: Path, results: list[dict[str, Any]]) -> None:
@@ -70,42 +69,3 @@ class Exporter(QObject):
         stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         session = ensure_dir(Path(out_dir) / f"detection_{stamp}")
         return session
-
-
-class ExportWorker(QThread):
-    """后台导出线程 — 大批量场景用"""
-
-    progress = Signal(int, int)
-    finished_ok = Signal(str)
-    failed = Signal(str)
-
-    def __init__(
-        self,
-        out_dir: str,
-        results: list[dict[str, Any]] | None,
-        annotated_rgb: np.ndarray | None,
-        summary: dict[str, int] | None = None,
-        parent=None,
-    ) -> None:
-        super().__init__(parent)
-        self.out_dir = out_dir
-        self.results = results          # None = 不写明细 result.csv
-        self.annotated_rgb = annotated_rgb  # None = 不写带框图
-        self.summary = summary          # None/空 = 不写汇总 summary.csv
-
-    def run(self) -> None:
-        try:
-            session = Exporter.make_session_dir(self.out_dir)
-            self.progress.emit(0, 1)
-            if self.results is not None:
-                Exporter._write_csv(session / "result.csv", self.results)
-            if self.annotated_rgb is not None:
-                Exporter._write_image(session / "annotated.jpg", self.annotated_rgb)
-            if self.summary:
-                Exporter.write_summary_csv(session / "summary.csv", self.summary)
-            self.progress.emit(1, 1)
-            log.info("导出成功: %s", session)
-            self.finished_ok.emit(str(session))
-        except Exception as e:
-            log.error("导出失败: %s", e)
-            self.failed.emit(str(e))
