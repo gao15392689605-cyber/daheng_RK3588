@@ -34,6 +34,10 @@ log = get_logger("main_window")
 
 _MODE_CN = {MODE_PHOTO: "照片", MODE_VIDEO: "视频", MODE_FOLDER: "文件夹", MODE_CAMERA: "工业相机"}
 
+# 拒绝在限时内退出的 worker 暂存于此(模块级, 不随窗口销毁). 绝不 terminate/析构正在跑的线程
+# (两者都会 "FATAL: exception not rethrown / Aborted"); 由其自行结束或进程退出时回收.
+_ZOMBIE_WORKERS: list = []
+
 
 class MainWindow(LayoutMixin, QMainWindow):
 
@@ -400,9 +404,12 @@ class MainWindow(LayoutMixin, QMainWindow):
         self._dispose_worker()
 
     def _dispose_worker(self) -> None:
-        """安全停止并释放当前 worker — 等线程真正退出再丢引用, 杜绝
-        "QThread: Destroyed while thread is still running" 导致的 Aborted 崩溃.
-        用局部引用持有, 防 wait 期间被 GC; 超时 terminate 兜底.
+        """安全停止并释放当前 worker.
+
+        关键: 绝不调用 QThread.terminate() — 强杀正在跑 Python / 持锁的线程会
+        "FATAL: exception not rethrown" 直接 Aborted. 改为协作式停止(stop 标志)+ wait;
+        万一线程没在限时内退出, 转入模块级僵尸列表保活(既不强杀也不让其被 GC 析构,
+        两者都会 Aborted), 等其自行结束或进程退出时回收. 用局部引用防 wait 期间被 GC.
         """
         w = self.worker
         self.worker = None
@@ -410,10 +417,11 @@ class MainWindow(LayoutMixin, QMainWindow):
             return
         try:
             w.stop()
-            if not w.wait(3000):
-                log.warning("worker 3s 未退出, 强制 terminate")
-                w.terminate()
-                w.wait(1000)
+            if w.wait(5000):
+                return  # 正常退出
+            log.warning("worker 未在 5s 内退出, 转入僵尸列表(不 terminate/不析构), 待其自行结束")
+            _ZOMBIE_WORKERS[:] = [z for z in _ZOMBIE_WORKERS if z.isRunning()]
+            _ZOMBIE_WORKERS.append(w)
         except Exception as e:
             log.error("回收 worker 异常: %s", e)
 
@@ -636,9 +644,11 @@ class MainWindow(LayoutMixin, QMainWindow):
         logout 流程会先 show 登录窗再 close 主窗, 此时不是最后一个窗口, 不退出.
         """
         try:
-            self._dispose_worker()  # 安全停止 + 等线程退出 + terminate 兜底
-            # 彻底关闭相机设备 (close_device) 而不仅仅停流
+            if self.worker is not None:
+                self.worker.stop()  # 先置停止标志
+            # 先关相机(close_device): 解开可能阻塞在取流 get_image 的 worker, 让它能尽快退出
             self.camera_mgr.shutdown()
+            self._dispose_worker()  # 再协作式等待回收(不 terminate)
             self.scene.clear()
             self.pix_item = None
         except Exception as e:
