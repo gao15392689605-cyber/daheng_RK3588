@@ -312,8 +312,8 @@ class MainWindow(LayoutMixin, QMainWindow):
 
         self.start_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
-        # 暂停只给摄像头 (视频/文件夹跑完看翻阅, 不做暂停)
-        self.pause_btn.setEnabled(mode == MODE_CAMERA)
+        # 暂停开放给 视频/文件夹/摄像头 (照片单图瞬间完成, 无需暂停)
+        self.pause_btn.setEnabled(mode != MODE_PHOTO)
         self.pause_btn.setChecked(False)
         self.pause_btn.setText("⏸ 暂停")
         self.center_status.setText(f"检测中 — {file_path or '工业相机'}")
@@ -330,8 +330,9 @@ class MainWindow(LayoutMixin, QMainWindow):
         self.worker.set_paused(paused)
         self.pause_btn.setText("▶ 继续" if paused else "⏸ 暂停")
         self.center_status.setText("已暂停" if paused else "检测中")
-        if paused:
-            # 暂停即出累计总计 (峰值不清零, 继续可叠加)
+        # 仅摄像头: 暂停即出累计总计 (峰值不清零, 继续可叠加).
+        # 视频/文件夹暂停只冻结画面, 不弹窗打断 (方便暂停看某一帧).
+        if paused and state.detect_mode == MODE_CAMERA:
             self._show_summary_popup()
 
     def _on_stop(self) -> None:
