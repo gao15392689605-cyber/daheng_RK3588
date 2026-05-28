@@ -82,29 +82,28 @@ class ExportWorker(QThread):
     def __init__(
         self,
         out_dir: str,
-        results: list[dict[str, Any]],
+        results: list[dict[str, Any]] | None,
         annotated_rgb: np.ndarray | None,
         summary: dict[str, int] | None = None,
         parent=None,
     ) -> None:
         super().__init__(parent)
         self.out_dir = out_dir
-        self.results = results
-        self.annotated_rgb = annotated_rgb
-        self.summary = summary  # 会话总计峰值, 非空则额外写 summary.csv
+        self.results = results          # None = 不写明细 result.csv
+        self.annotated_rgb = annotated_rgb  # None = 不写带框图
+        self.summary = summary          # None/空 = 不写汇总 summary.csv
 
     def run(self) -> None:
         try:
             session = Exporter.make_session_dir(self.out_dir)
-            steps = 3 if self.summary else 2
-            self.progress.emit(0, steps)
-            Exporter._write_csv(session / "result.csv", self.results)
-            self.progress.emit(1, steps)
-            Exporter._write_image(session / "annotated.jpg", self.annotated_rgb)
-            self.progress.emit(2, steps)
+            self.progress.emit(0, 1)
+            if self.results is not None:
+                Exporter._write_csv(session / "result.csv", self.results)
+            if self.annotated_rgb is not None:
+                Exporter._write_image(session / "annotated.jpg", self.annotated_rgb)
             if self.summary:
                 Exporter.write_summary_csv(session / "summary.csv", self.summary)
-                self.progress.emit(3, steps)
+            self.progress.emit(1, 1)
             log.info("导出成功: %s", session)
             self.finished_ok.emit(str(session))
         except Exception as e:

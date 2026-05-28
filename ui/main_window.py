@@ -24,7 +24,9 @@ from core.source import CameraSource, FolderSource, PhotoSource, VideoSource
 from db.db_helper import DbHelper
 from ui._main_layout import LayoutMixin
 from ui.login_window import EditProfileDialog, RegisterDialog
-from ui.panels import CameraSettingsDialog, DetectionSummaryDialog, HistoryQueryWidget
+from ui.panels import (
+    CameraSettingsDialog, DetectionSummaryDialog, HistoryQueryWidget, ask_save_kind,
+)
 from ui.widgets import ndarray_to_pixmap
 from utils.common import get_logger, list_media_files
 
@@ -141,16 +143,10 @@ class MainWindow(LayoutMixin, QMainWindow):
         if not self._app_runs:
             QMessageBox.information(self, "提示", "本次使用还没有任何检测可保存")
             return
-        box = QMessageBox(self)
-        box.setWindowTitle("结果保存 — 全程检测")
-        box.setText(f"将保存本次使用全程 {len(self._app_runs)} 次推理的检测结果。\n保存哪些内容?")
-        btn_sum = box.addButton("仅汇总", QMessageBox.AcceptRole)
-        btn_det = box.addButton("仅明细", QMessageBox.AcceptRole)
-        btn_both = box.addButton("两者都要", QMessageBox.AcceptRole)
-        box.addButton("取消", QMessageBox.RejectRole)
-        box.exec()
-        clicked = box.clickedButton()
-        if clicked not in (btn_sum, btn_det, btn_both):
+        kind = ask_save_kind(
+            self, f"将保存本次使用全程 {len(self._app_runs)} 次推理的检测结果。\n保存哪些内容?",
+        )
+        if kind is None:
             return
         d = QFileDialog.getExistingDirectory(
             self, "选择保存目录", state.export_dir or str(Path.home()),
@@ -159,12 +155,12 @@ class MainWindow(LayoutMixin, QMainWindow):
             return
         try:
             session = Exporter.make_session_dir(d)
-            if clicked in (btn_sum, btn_both):
+            if kind in ("summary", "both"):
                 agg: Counter = Counter()
                 for r in self._app_runs:
                     agg.update(r["peak"])
                 Exporter.write_summary_csv(session / "全程汇总.csv", dict(agg))
-            if clicked in (btn_det, btn_both):
+            if kind in ("detail", "both"):
                 Exporter.write_app_detail_csv(session / "全程明细.csv", self._app_runs)
             QMessageBox.information(self, "已保存", f"全程检测结果已保存到\n{session}")
         except Exception as e:
@@ -381,7 +377,10 @@ class MainWindow(LayoutMixin, QMainWindow):
             self._show_summary_popup()
 
     def _show_summary_popup(self) -> None:
-        DetectionSummaryDialog(state.detect_mode, dict(self._session_peak), self).exec()
+        DetectionSummaryDialog(
+            state.detect_mode, dict(self._session_peak),
+            on_save=self._save_current, parent=self,
+        ).exec()
 
     def _finalize_run(self, status: str) -> None:
         self.start_btn.setEnabled(True)
@@ -540,28 +539,39 @@ class MainWindow(LayoutMixin, QMainWindow):
         self._apply_filter_now()
 
     def _on_export(self) -> None:
-        # 当前帧结果 或 会话总计 任一非空即可导出 (总计弹窗没保存也能从这补存)
+        self._save_current()
+
+    def _save_current(self) -> None:
+        """本次推理结果保存 — 右侧「结果导出」与总计弹窗「保存结果」共用.
+
+        弹 仅汇总/仅明细/两者: 汇总=本次各类峰值 summary.csv;
+        明细=当前帧逐条 result.csv + 带框图. 无明细数据时只存汇总.
+        """
         if not state.current_results and not self._session_peak:
-            QMessageBox.information(self, "提示", "当前无可导出结果")
+            QMessageBox.information(self, "提示", "本次无可保存结果")
             return
-        # 优先用预设导出目录, 否则弹窗
+        has_detail = bool(state.current_results)
+        kind = ask_save_kind(self, "保存本次检测结果，存哪些?") if has_detail else "summary"
+        if kind is None:
+            return
         d = state.export_dir or QFileDialog.getExistingDirectory(
-            self, "选择导出目录", str(Path.home()),
+            self, "选择保存目录", str(Path.home()),
         )
         if not d:
             return
-        # 导出带框图: skip_draw 模式下 last_annotated_rgb 是原图, 这里调 paint_annotations 重新画
-        from inference import paint_annotations
-        export_img = state.last_annotated_rgb
-        if export_img is not None and state.current_results:
-            try:
-                export_img = paint_annotations(export_img, state.current_results)
-            except Exception as e:
-                log.error("导出画框失败, 使用原图: %s", e)
-        # 一并带上会话总计 (summary.csv), 与总计弹窗的"保存结果"联动
-        self._export_worker = ExportWorker(
-            d, state.current_results, export_img, dict(self._session_peak),
-        )
+        results = state.current_results if kind in ("detail", "both") else None
+        summary = dict(self._session_peak) if kind in ("summary", "both") else None
+        export_img = None
+        if results is not None:
+            # 带框图: skip_draw 模式下 last_annotated_rgb 是原图, 调 paint_annotations 重新画
+            from inference import paint_annotations
+            export_img = state.last_annotated_rgb
+            if export_img is not None and results:
+                try:
+                    export_img = paint_annotations(export_img, results)
+                except Exception as e:
+                    log.error("导出画框失败, 使用原图: %s", e)
+        self._export_worker = ExportWorker(d, results, export_img, summary)
         ew = self._export_worker
         ew.progress.connect(lambda c, t: (
             self.export_progress.setRange(0, max(1, t)),

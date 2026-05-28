@@ -21,6 +21,22 @@ from db.db_helper import DbHelper
 from ui.widgets import make_round_pixmap
 
 
+def ask_save_kind(parent, text: str) -> str | None:
+    """弹「仅汇总 / 仅明细 / 两者 / 取消」, 返回 'summary' / 'detail' / 'both' / None.
+
+    所有保存/导出入口共用, 保证交互一致.
+    """
+    box = QMessageBox(parent)
+    box.setWindowTitle("保存内容选择")
+    box.setText(text)
+    b_sum = box.addButton("仅汇总", QMessageBox.AcceptRole)
+    b_det = box.addButton("仅明细", QMessageBox.AcceptRole)
+    b_both = box.addButton("两者都要", QMessageBox.AcceptRole)
+    box.addButton("取消", QMessageBox.RejectRole)
+    box.exec()
+    return {b_sum: "summary", b_det: "detail", b_both: "both"}.get(box.clickedButton())
+
+
 class HistoryQueryWidget(QDialog):
     """历史检测记录查询弹窗 — 当前登录用户的审计日志"""
 
@@ -317,10 +333,11 @@ class DetectionSummaryDialog(QDialog):
 
     _MODE_CN = {"photo": "照片", "video": "视频", "folder": "文件夹批量", "camera": "工业相机"}
 
-    def __init__(self, mode: str, peak: dict[str, int], parent=None) -> None:
+    def __init__(self, mode: str, peak: dict[str, int], on_save=None, parent=None) -> None:
         super().__init__(parent)
         self._peak = {k: v for k, v in peak.items() if v > 0}
         self._mode_cn = self._MODE_CN.get(mode, mode)
+        self._on_save_cb = on_save  # 主窗口的'本次保存'(带 汇总/明细/两者 选择); None 则只存汇总
         self.setWindowTitle("本次检测总计")
         self.resize(420, 460)
         self.setStyleSheet(f"background:{COLOR_BG_MAIN}; color:{COLOR_TEXT};")
@@ -397,6 +414,11 @@ class DetectionSummaryDialog(QDialog):
         lay.addLayout(btn_bar)
 
     def _on_save(self) -> None:
+        # 交给主窗口统一的'本次保存'(带 仅汇总/仅明细/两者 选择, 与右侧导出一致)
+        if self._on_save_cb is not None:
+            self._on_save_cb()
+            return
+        # 兜底: 无回调时只存汇总
         if not self._peak:
             QMessageBox.information(self, "提示", "本次无检测结果可保存")
             return
@@ -406,7 +428,7 @@ class DetectionSummaryDialog(QDialog):
         if not fp:
             return
         try:
-            Exporter.write_summary_csv(fp, self._peak)  # 与右侧导出共用同一写法(联动)
+            Exporter.write_summary_csv(fp, self._peak)
             QMessageBox.information(self, "已保存", f"总计结果已保存\n{fp}")
         except Exception as e:
             QMessageBox.warning(self, "保存失败", str(e))
