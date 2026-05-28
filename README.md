@@ -25,7 +25,7 @@
 | 4 种数据源 | 单图 / 视频 / 文件夹批量 / 大恒工业相机 |
 | OBB 渲染 | QGraphicsView + draw_annotations 中文标签 + 类别配色 |
 | 结果过滤 | 10 类异物 CheckBox 实时过滤, 类别统计纯数字 |
-| 导出 | 一键导出 CSV + JSON + 带框图片 (格式写死) |
+| 导出 | 一键导出 CSV + 带框图片 (格式写死) |
 | 个人中心 | 圆形头像 + 改密 + 注册 + **历史检测记录查询** + 退出登录 |
 | 审计日志 | 每次启动 / 停止检测自动入库, 关联用户名 + 时间 + 类别统计 |
 | 资源释放 | closeEvent 自动停止线程 / 关闭相机 / 释放 RKNN / 关闭数据库 |
@@ -120,7 +120,7 @@ tobacco_detection_system/
 │   ├── source.py             # Photo/Video/Folder/CameraSource 抽象
 │   ├── detector.py           # DetectionWorker + FolderBatchWorker (QThread)
 │   ├── camera_manager.py     # 大恒相机封装
-│   └── exporter.py           # CSV/JSON/图 导出
+│   └── exporter.py           # CSV/图 导出
 ├── db/
 │   ├── init.sql              # users + detection_logs schema
 │   ├── db_helper.py          # DbHelper 单例
