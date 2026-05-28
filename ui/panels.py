@@ -16,6 +16,7 @@ from config import (
     COLOR_BG_MAIN, COLOR_BG_SIDE, COLOR_BORDER, COLOR_BTN_PRIMARY, COLOR_TEXT, COLOR_TEXT_DIM,
 )
 from core.app_state import state
+from core.exporter import Exporter
 from db.db_helper import DbHelper
 from ui.widgets import make_round_pixmap
 
@@ -399,19 +400,13 @@ class DetectionSummaryDialog(QDialog):
         if not self._peak:
             QMessageBox.information(self, "提示", "本次无检测结果可保存")
             return
-        import csv
         import time
         default = f"检测总计_{self._mode_cn}_{time.strftime('%Y%m%d_%H%M%S')}.csv"
         fp, _ = QFileDialog.getSaveFileName(self, "保存总计结果", default, "CSV (*.csv)")
         if not fp:
             return
         try:
-            with open(fp, "w", newline="", encoding="utf-8-sig") as f:
-                w = csv.writer(f)
-                w.writerow(["类别", "最多同时数量"])
-                for cls, n in sorted(self._peak.items(), key=lambda kv: -kv[1]):
-                    w.writerow([cls, n])
-                w.writerow(["总计", sum(self._peak.values())])
+            Exporter.write_summary_csv(fp, self._peak)  # 与右侧导出共用同一写法(联动)
             QMessageBox.information(self, "已保存", f"总计结果已保存\n{fp}")
         except Exception as e:
             QMessageBox.warning(self, "保存失败", str(e))

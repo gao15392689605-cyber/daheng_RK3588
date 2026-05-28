@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +19,7 @@ from config import (
 from core.app_state import state
 from core.camera_manager import CameraManager
 from core.detector import DetectionWorker, FolderBatchWorker
-from core.exporter import ExportWorker
+from core.exporter import Exporter, ExportWorker
 from core.source import CameraSource, FolderSource, PhotoSource, VideoSource
 from db.db_helper import DbHelper
 from ui._main_layout import LayoutMixin
@@ -28,6 +29,8 @@ from ui.widgets import ndarray_to_pixmap
 from utils.common import get_logger, list_media_files
 
 log = get_logger("main_window")
+
+_MODE_CN = {MODE_PHOTO: "照片", MODE_VIDEO: "视频", MODE_FOLDER: "文件夹", MODE_CAMERA: "工业相机"}
 
 
 class MainWindow(LayoutMixin, QMainWindow):
@@ -53,6 +56,9 @@ class MainWindow(LayoutMixin, QMainWindow):
         # 文件夹批量结果缓存 (路径 + 检测), 供跑完后左右翻阅; 不存图, 翻阅时重读省内存
         self._folder_results: list[dict[str, Any]] = []
         self._folder_idx: int = 0
+        # 本次使用(从打开软件到现在)的全程检测记录: 每次推理一行汇总
+        self._app_runs: list[dict[str, Any]] = []
+        self._current_mode: str = ""  # 当前/最近一次推理的模式 (供全程记录用)
 
         self._build()
         self._wire_signals()
@@ -112,7 +118,7 @@ class MainWindow(LayoutMixin, QMainWindow):
         elif key == "model":
             self._choose_model()
         elif key == "export_dir":
-            self._choose_export_dir()
+            self._save_app_results()  # 左侧「结果保存」= 存全程检测
         elif key == "cam_settings":
             self._open_camera_settings()
 
@@ -126,13 +132,44 @@ class MainWindow(LayoutMixin, QMainWindow):
             state.model_name = Path(fp).name
             QMessageBox.information(self, "提示", f"模型已切换: {state.model_name}\n重启后生效")
 
-    def _choose_export_dir(self) -> None:
+    def _save_app_results(self) -> None:
+        """左侧「结果保存」— 保存本次使用(从打开软件到现在)全程检测.
+
+        每次推理一行汇总; 可选 仅汇总 / 仅明细 / 两者.
+        汇总 = 全程各类总数(各次峰值相加); 明细 = 每次推理一行.
+        """
+        if not self._app_runs:
+            QMessageBox.information(self, "提示", "本次使用还没有任何检测可保存")
+            return
+        box = QMessageBox(self)
+        box.setWindowTitle("结果保存 — 全程检测")
+        box.setText(f"将保存本次使用全程 {len(self._app_runs)} 次推理的检测结果。\n保存哪些内容?")
+        btn_sum = box.addButton("仅汇总", QMessageBox.AcceptRole)
+        btn_det = box.addButton("仅明细", QMessageBox.AcceptRole)
+        btn_both = box.addButton("两者都要", QMessageBox.AcceptRole)
+        box.addButton("取消", QMessageBox.RejectRole)
+        box.exec()
+        clicked = box.clickedButton()
+        if clicked not in (btn_sum, btn_det, btn_both):
+            return
         d = QFileDialog.getExistingDirectory(
-            self, "选择默认导出目录", state.export_dir or str(Path.home()),
+            self, "选择保存目录", state.export_dir or str(Path.home()),
         )
-        if d:
-            state.export_dir = d
-            QMessageBox.information(self, "提示", f"默认导出目录已设置:\n{d}")
+        if not d:
+            return
+        try:
+            session = Exporter.make_session_dir(d)
+            if clicked in (btn_sum, btn_both):
+                agg: Counter = Counter()
+                for r in self._app_runs:
+                    agg.update(r["peak"])
+                Exporter.write_summary_csv(session / "全程汇总.csv", dict(agg))
+            if clicked in (btn_det, btn_both):
+                Exporter.write_app_detail_csv(session / "全程明细.csv", self._app_runs)
+            QMessageBox.information(self, "已保存", f"全程检测结果已保存到\n{session}")
+        except Exception as e:
+            log.error("全程结果保存失败: %s", e)
+            QMessageBox.warning(self, "保存失败", str(e))
 
     def _on_capture(self) -> None:
         """相机模式: 抓取当前帧, 弹窗选 [推理]/[保存图片]/[取消]"""
@@ -250,6 +287,7 @@ class MainWindow(LayoutMixin, QMainWindow):
         if mode == MODE_VIDEO:
             self.worker.frame_skip = 2
         self._current_file_path = file_path
+        self._current_mode = mode  # 记下本次推理模式 (供全程记录, 切源前 finalize 用的是上一次的值)
         # 会话级状态清零 — 重选视频/重开摄像头即重新计数
         self._session_peak = Counter()
         self._summary_shown = False
@@ -360,6 +398,15 @@ class MainWindow(LayoutMixin, QMainWindow):
                 status=status,
             )
             self._current_log_id = -1
+            # 全程记录: 每次推理一行汇总 (log_id>0 保证一次会话只记一次, 不重复)
+            if self._session_peak:
+                self._app_runs.append({
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "mode": _MODE_CN.get(self._current_mode, self._current_mode),
+                    "file": self._current_file_path,
+                    "peak": dict(self._session_peak),
+                    "total": sum(self._session_peak.values()),
+                })
         self.worker = None
 
     def _on_progress(self, cur: int, total: int) -> None:
@@ -413,10 +460,13 @@ class MainWindow(LayoutMixin, QMainWindow):
         self.right_panel.show_detail(state.current_results[0] if state.current_results else {})
 
     def _on_folder_file_done(self, path: str, count: int) -> None:
-        """文件夹批量: 缓存每张图的 路径 + 检测结果, 供跑完后左右翻阅(不存图省内存)"""
+        """文件夹批量: 缓存每张图的 路径 + 检测结果 + 推理时图像尺寸 (不存图省内存)"""
+        img = state.last_image_rgb
+        shape = tuple(img.shape[:2]) if img is not None else None  # (h, w) 推理所用尺寸
         self._folder_results.append({
             "path": path,
             "detections": list(self._last_full_detections),
+            "shape": shape,
         })
 
     def _set_folder_nav_visible(self, visible: bool) -> None:
@@ -436,6 +486,11 @@ class MainWindow(LayoutMixin, QMainWindow):
             self.center_status.setText(f"无法读取: {r['path']}")
             return
         rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+        # 检测框坐标基于"推理时的图像尺寸"; 推理对大图(>4096)会缩放, 重读原图尺寸不同会导致框偏移.
+        # 这里把重读图缩放回推理尺寸, 保证框与目标对齐.
+        shape = r.get("shape")
+        if shape is not None and tuple(rgb.shape[:2]) != tuple(shape):
+            rgb = cv2.resize(rgb, (shape[1], shape[0]), interpolation=cv2.INTER_AREA)
         self.view.user_zoomed = False  # 换图重新自适应
         self._render_frame(rgb, r["detections"], r["path"])
         self.folder_page_label.setText(f"第 {i+1}/{n} 张 — {Path(r['path']).name}")
@@ -485,7 +540,8 @@ class MainWindow(LayoutMixin, QMainWindow):
         self._apply_filter_now()
 
     def _on_export(self) -> None:
-        if not state.current_results:
+        # 当前帧结果 或 会话总计 任一非空即可导出 (总计弹窗没保存也能从这补存)
+        if not state.current_results and not self._session_peak:
             QMessageBox.information(self, "提示", "当前无可导出结果")
             return
         # 优先用预设导出目录, 否则弹窗
@@ -502,7 +558,10 @@ class MainWindow(LayoutMixin, QMainWindow):
                 export_img = paint_annotations(export_img, state.current_results)
             except Exception as e:
                 log.error("导出画框失败, 使用原图: %s", e)
-        self._export_worker = ExportWorker(d, state.current_results, export_img)
+        # 一并带上会话总计 (summary.csv), 与总计弹窗的"保存结果"联动
+        self._export_worker = ExportWorker(
+            d, state.current_results, export_img, dict(self._session_peak),
+        )
         ew = self._export_worker
         ew.progress.connect(lambda c, t: (
             self.export_progress.setRange(0, max(1, t)),
