@@ -18,16 +18,32 @@ class Exporter:
     """同步导出工具(纯静态方法). 每次导出新建独立子文件夹 detection_YYYYMMDD_HHMMSS/."""
 
     @staticmethod
-    def _write_csv(csv_path: Path, results: list[dict[str, Any]]) -> None:
+    def _fmt_points(points: Any) -> str:
+        """OBB 四角点 → 'x0,y0 x1,y1 x2,y2 x3,y3' 字符串; 无坐标返回 '—'"""
+        if not points:
+            return "—"
+        try:
+            return " ".join(f"{float(x):.0f},{float(y):.0f}" for x, y in points)
+        except (TypeError, ValueError):
+            return "—"
+
+    @staticmethod
+    def write_detail_csv(csv_path: Path, rows: list[dict[str, Any]]) -> None:
+        """检测明细 — 每个目标一行: 序号/路径/帧序号/类别/置信度/坐标(OBB四角点).
+
+        rows: [{"path": str, "frame_no": int|str, "det": detection_dict}, ...]
+        照片单帧/文件夹逐图/视频相机逐帧都汇成这一种平铺格式.
+        """
         with open(csv_path, "w", newline="", encoding="utf-8-sig") as f:
             w = csv.writer(f)
-            w.writerow(["序号", "类别", "置信度", "档位", "合并数", "面积占比"])
-            for i, d in enumerate(results, 1):
+            w.writerow(["序号", "路径", "帧序号", "类别", "置信度", "坐标"])
+            for i, r in enumerate(rows, 1):
+                d = r.get("det", {})
                 w.writerow([
-                    i, d.get("class_name", ""),
+                    i, r.get("path", "") or "—", r.get("frame_no", ""),
+                    d.get("class_name", ""),
                     f"{d.get('confidence', 0.0):.4f}",
-                    d.get("tier", ""), d.get("merged", 1),
-                    f"{d.get('area_ratio', 0.0):.4f}",
+                    Exporter._fmt_points(d.get("points")),
                 ])
 
     @staticmethod

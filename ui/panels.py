@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor, QPalette, QPixmap
+from PySide6.QtGui import QColor, QFont, QPalette, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView, QDialog, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
     QInputDialog, QLabel, QLineEdit, QMessageBox, QPushButton, QSlider,
@@ -21,20 +21,26 @@ from db.db_helper import DbHelper
 from ui.widgets import make_round_pixmap
 
 
-def ask_save_kind(parent, text: str) -> str | None:
-    """弹「仅汇总 / 仅明细 / 两者 / 取消」, 返回 'summary' / 'detail' / 'both' / None.
+def ask_save_kind(parent, text: str, allow_image: bool = False) -> set[str] | None:
+    """弹保存内容选择, 返回 {'image','detail','summary'} 的子集; 取消返回 None.
 
-    所有保存/导出入口共用, 保证交互一致.
+    allow_image=True  (照片/文件夹等静态图): 照片 / 明细 / 汇总 / 全部 / 取消
+    allow_image=False (视频/摄像头/全程):    明细 / 汇总 / 全部 / 取消
+    "全部" = 该场景全部可选内容. 所有保存/导出入口共用, 保证交互一致.
     """
     box = QMessageBox(parent)
     box.setWindowTitle("保存内容选择")
     box.setText(text)
-    b_sum = box.addButton("仅汇总", QMessageBox.AcceptRole)
-    b_det = box.addButton("仅明细", QMessageBox.AcceptRole)
-    b_both = box.addButton("两者都要", QMessageBox.AcceptRole)
+    btns: dict = {}
+    if allow_image:
+        btns[box.addButton("照片", QMessageBox.AcceptRole)] = {"image"}
+    btns[box.addButton("明细", QMessageBox.AcceptRole)] = {"detail"}
+    btns[box.addButton("汇总", QMessageBox.AcceptRole)] = {"summary"}
+    all_set = {"detail", "summary"} | ({"image"} if allow_image else set())
+    btns[box.addButton("全部", QMessageBox.AcceptRole)] = all_set
     box.addButton("取消", QMessageBox.RejectRole)
     box.exec()
-    return {b_sum: "summary", b_det: "detail", b_both: "both"}.get(box.clickedButton())
+    return btns.get(box.clickedButton())
 
 
 class HistoryQueryWidget(QDialog):
@@ -43,6 +49,8 @@ class HistoryQueryWidget(QDialog):
     def __init__(self, username: str, parent=None) -> None:
         super().__init__(parent)
         self.username = username
+        # 工人=按批次; 技术员=按每次推理(逐次调试记录)
+        self._is_worker = (state.role == "worker")
         self.setWindowTitle(f"历史检测记录 — {username}")
         self.resize(900, 520)
         self.setStyleSheet(f"background:{COLOR_BG_MAIN}; color:{COLOR_TEXT};")
@@ -51,15 +59,19 @@ class HistoryQueryWidget(QDialog):
 
     def _build(self) -> None:
         lay = QVBoxLayout(self)
-        title = QLabel(f"操作员【{self.username}】的检测审计日志（按时间倒序）")
+        if self._is_worker:
+            cap = "的批次检测记录（每个批次结束后存一条 · 按时间倒序）"
+            headers = ["批次号", "品种", "开始时间", "结束时间"]
+        else:
+            cap = "的逐次检测记录（每推理一次记一条 · 按时间倒序）"
+            headers = ["检测时间", "模式", "文件", "总检出", "异物分布", "状态"]
+        title = QLabel(f"操作员【{self.username}】{cap}")
         title.setStyleSheet(f"color:{COLOR_TEXT}; font-size:14px; font-weight:bold; padding:6px;")
         lay.addWidget(title)
 
         self.table = QTableWidget()
-        self.table.setColumnCount(6)
-        self.table.setHorizontalHeaderLabels([
-            "检测时间", "模式", "文件路径", "总目标数", "异物分布", "状态",
-        ])
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         # 关掉 alternating row, 避免某些 Qt 版本下 stylesheet 不生效导致白底
@@ -102,11 +114,32 @@ class HistoryQueryWidget(QDialog):
             "QPushButton:hover { background:#E66662; }"
         )
         clear_btn.clicked.connect(self._on_clear)
+        export_btn = QPushButton("⬇ 导出 CSV"); export_btn.setStyleSheet(btn_qss)
+        export_btn.clicked.connect(self._on_export)
         close_btn = QPushButton("关闭"); close_btn.setStyleSheet(btn_qss)
         close_btn.clicked.connect(self.accept)
         btn_bar.addStretch()
-        btn_bar.addWidget(clear_btn); btn_bar.addWidget(refresh_btn); btn_bar.addWidget(close_btn)
+        btn_bar.addWidget(clear_btn); btn_bar.addWidget(export_btn)
+        btn_bar.addWidget(refresh_btn); btn_bar.addWidget(close_btn)
         lay.addLayout(btn_bar)
+
+    def _on_export(self) -> None:
+        import csv
+        from pathlib import Path as _Path
+        rows = getattr(self, "_export_rows", [])
+        if not rows:
+            QMessageBox.information(self, "提示", "暂无记录可导出"); return
+        default = f"检测记录_{self.username}.csv"
+        fp, _ = QFileDialog.getSaveFileName(self, "导出 CSV", str(_Path.home() / default), "CSV (*.csv)")
+        if not fp:
+            return
+        try:
+            with open(fp, "w", newline="", encoding="utf-8-sig") as f:
+                w = csv.DictWriter(f, fieldnames=list(rows[0].keys()))
+                w.writeheader(); w.writerows(rows)
+            QMessageBox.information(self, "已导出", f"已保存到\n{fp}")
+        except Exception as e:
+            QMessageBox.warning(self, "导出失败", str(e))
 
     def _on_clear(self) -> None:
         count = self.table.rowCount()
@@ -132,22 +165,50 @@ class HistoryQueryWidget(QDialog):
         if not DbHelper.instance().verify_user(self.username, pwd):
             QMessageBox.warning(self, "密码错误", "密码不正确, 已取消清空")
             return
-        deleted = DbHelper.instance().clear_logs(self.username)
-        QMessageBox.information(self, "已清空", f"删除了 {deleted} 条记录")
+        db = DbHelper.instance()
+        n_log = db.clear_logs(self.username)
+        if self._is_worker:
+            n_batch = db.delete_user_batches(self.username)
+            msg = f"删除了 {n_batch} 个批次 / {n_log} 条检测明细"
+        else:
+            msg = f"删除了 {n_log} 条检测记录"
+        QMessageBox.information(self, "已清空", msg)
         self._reload()
 
+    _MODE_CN = {"photo": "照片", "video": "视频", "folder": "文件夹", "camera": "工业相机"}
+
     def _reload(self) -> None:
-        logs = DbHelper.instance().query_logs(self.username, limit=500)
+        import json
+        db = DbHelper.instance()
         self.table.setRowCount(0)
-        for r in logs:
+        self._export_rows = []   # 供导出 CSV
+        if self._is_worker:
+            # 工人: 批次基本信息(明细在管理员批次追溯里)
+            for b in db.list_batches(500, operator=self.username):
+                d = {"批次号": b["batch_id"], "品种": b.get("variety") or "—",
+                     "开始时间": str(b.get("start_time", "")),
+                     "结束时间": str(b.get("end_time") or "进行中")}
+                self._export_rows.append(d)
+        else:
+            # 技术员: 每次推理一条(调试记录)
+            for r in db.query_logs(self.username, limit=500):
+                try:
+                    rs = json.loads(r.get("result_summary") or "{}")
+                    dist = "、".join(f"{k}×{v}" for k, v in rs.items()) or "—"
+                except Exception:
+                    dist = "—"
+                d = {"检测时间": str(r.get("start_time", "")),
+                     "模式": self._MODE_CN.get(r.get("detect_mode", ""), r.get("detect_mode", "")),
+                     "文件": r.get("file_path", "") or "—",
+                     "总检出": str(r.get("total_targets", 0)), "异物分布": dist,
+                     "状态": r.get("status", "") or "—"}
+                self._export_rows.append(d)
+        # 填表
+        for d in self._export_rows:
             row = self.table.rowCount()
             self.table.insertRow(row)
-            self.table.setItem(row, 0, QTableWidgetItem(str(r.get("start_time", ""))))
-            self.table.setItem(row, 1, QTableWidgetItem(r.get("detect_mode", "")))
-            self.table.setItem(row, 2, QTableWidgetItem(r.get("file_path", "") or "—"))
-            self.table.setItem(row, 3, QTableWidgetItem(str(r.get("total_targets", 0))))
-            self.table.setItem(row, 4, QTableWidgetItem(r.get("result_summary", "{}")))
-            self.table.setItem(row, 5, QTableWidgetItem(r.get("status", "")))
+            for j, val in enumerate(d.values()):
+                self.table.setItem(row, j, QTableWidgetItem(str(val)))
 
 
 class CameraSettingsDialog(QDialog):
@@ -297,11 +358,10 @@ class ProfilePanel(QWidget):
         lay.addWidget(sub)
 
         lay.addSpacing(20)
+        # 去掉「注册新用户」(账号统一由管理员开通) 和「退出登录」(已挪到顶栏明面)
         for text, sig in [
             ("修改信息", self.edit_clicked),
-            ("注册新用户", self.register_clicked),
             ("历史检测记录", self.history_clicked),
-            ("退出登录", self.logout_clicked),
         ]:
             btn = QPushButton(text); btn.setMinimumHeight(38)
             btn.setStyleSheet(
@@ -323,6 +383,98 @@ class ProfilePanel(QWidget):
                 return
         self.avatar.setPixmap(QPixmap())
         self.avatar.setText(name[:1].upper() if name else "?")
+
+
+class WorkerDashboard(QWidget):
+    """工人看护页右侧大字看板 — 工人不需要坐标/置信度, 只要一眼看清生产状态。
+
+    显示: 批次号 / 运行时长 / 本批次累计检出 / 严重异物次数 / 各严重类计数 / 状态。
+    """
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setFixedWidth(300)
+        self.setStyleSheet(f"background:{COLOR_BG_SIDE}; color:{COLOR_TEXT};")
+        self._build()
+
+    def _big(self, color: str) -> QLabel:
+        lb = QLabel("0")
+        lb.setAlignment(Qt.AlignCenter)
+        lb.setStyleSheet(f"color:{color}; font-size:46px; font-weight:bold;")
+        return lb
+
+    def _cap(self, text: str) -> QLabel:
+        lb = QLabel(text)
+        lb.setAlignment(Qt.AlignCenter)
+        lb.setStyleSheet(f"color:{COLOR_TEXT_DIM}; font-size:13px;")
+        return lb
+
+    def _card(self, title: str, big: QLabel, lay) -> None:
+        box = QVBoxLayout(); box.setSpacing(2)
+        box.addWidget(self._cap(title)); box.addWidget(big)
+        frame = QWidget()
+        frame.setStyleSheet(
+            f"background:{COLOR_BG_MAIN}; border:1px solid {COLOR_BORDER}; border-radius:6px;")
+        frame.setLayout(box)
+        lay.addWidget(frame)
+
+    def _build(self) -> None:
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 18, 14, 18); lay.setSpacing(12)
+
+        title = QLabel("生产看护")
+        title.setAlignment(Qt.AlignCenter)
+        title.setStyleSheet(f"color:{COLOR_TEXT}; font-size:18px; font-weight:bold;")
+        lay.addWidget(title)
+
+        self.batch_lb = QLabel("批次: 未开始")
+        self.batch_lb.setAlignment(Qt.AlignCenter)
+        self.batch_lb.setStyleSheet("color:#FFD23F; font-size:15px; font-weight:bold;")
+        lay.addWidget(self.batch_lb)
+
+        self.time_lb = QLabel("已运行 00:00:00")
+        self.time_lb.setAlignment(Qt.AlignCenter)
+        self.time_lb.setStyleSheet(f"color:{COLOR_TEXT_DIM}; font-size:12px;")
+        lay.addWidget(self.time_lb)
+
+        self.total_big = self._big(COLOR_BTN_PRIMARY)
+        self._card("本批次累计检出(个)", self.total_big, lay)
+
+        self.severe_big = self._big("#E66662")
+        self._card("严重异物报警(次)", self.severe_big, lay)
+
+        lay.addWidget(self._cap("严重类别明细"))
+        self.detail_lb = QLabel("—")
+        self.detail_lb.setWordWrap(True)
+        self.detail_lb.setAlignment(Qt.AlignTop)
+        self.detail_lb.setFont(QFont("Microsoft YaHei", 11))
+        self.detail_lb.setStyleSheet(
+            f"color:{COLOR_TEXT}; background:{COLOR_BG_MAIN};"
+            f"border:1px solid {COLOR_BORDER}; border-radius:4px; padding:8px; min-height:70px;")
+        lay.addWidget(self.detail_lb, 1)
+
+        self.hint_lb = QLabel("点「开始批次」开始看护")
+        self.hint_lb.setWordWrap(True)
+        self.hint_lb.setAlignment(Qt.AlignCenter)
+        self.hint_lb.setStyleSheet(f"color:{COLOR_TEXT_DIM}; font-size:12px;")
+        lay.addWidget(self.hint_lb)
+
+    def set_batch(self, batch_id: str, running: bool) -> None:
+        self.batch_lb.setText(f"批次: {batch_id}" if batch_id else "批次: 未开始")
+        self.hint_lb.setText("检测中…发现严重异物会红屏报警" if running else "点「开始批次」开始看护")
+        if not running:
+            self.time_lb.setText("已运行 00:00:00")
+
+    def update_counts(self, total: int, severe_count: int,
+                      per_severe: dict[str, int], elapsed_sec: float) -> None:
+        self.total_big.setText(str(total))
+        self.severe_big.setText(str(severe_count))
+        if per_severe:
+            self.detail_lb.setText("\n".join(f"{k}：{v} 次" for k, v in per_severe.items()))
+        else:
+            self.detail_lb.setText("暂无严重异物")
+        h = int(elapsed_sec // 3600); m = int((elapsed_sec % 3600) // 60); s = int(elapsed_sec % 60)
+        self.time_lb.setText(f"已运行 {h:02d}:{m:02d}:{s:02d}")
 
 
 class DetectionSummaryDialog(QDialog):

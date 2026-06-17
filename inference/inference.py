@@ -63,20 +63,26 @@ def _detect_backend() -> tuple[str, Path]:
 
 BACKEND, MODEL_PATH = _detect_backend()
 
-# ── PT 后端: 仅在选中 PT 时导入 ───────────────────────
+# ── PT 后端: 容错惰性导入 (torch/ultralytics 缺失也不阻塞模块加载;
+#    真正需要时 load_model 的 .pt 分支会自行导入) ───────────────────────
+YOLO = None  # type: ignore
 if BACKEND == "pt":
-    import torch
-    LOCAL_ULTRA = PROJECT_ROOT / "ultralytics"
-    if LOCAL_ULTRA.exists():
-        sys.path.insert(0, str(LOCAL_ULTRA))
-    from ultralytics import YOLO  # noqa: E402
-    DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    DEVICE_NAME = (
-        f"GPU ({torch.cuda.get_device_name(0)})" if DEVICE == "cuda" else "CPU"
-    )
+    try:
+        import torch
+        LOCAL_ULTRA = PROJECT_ROOT / "ultralytics"
+        if LOCAL_ULTRA.exists():
+            sys.path.insert(0, str(LOCAL_ULTRA))
+        from ultralytics import YOLO  # noqa: E402
+        DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+        DEVICE_NAME = (
+            f"GPU ({torch.cuda.get_device_name(0)})" if DEVICE == "cuda" else "CPU"
+        )
+    except Exception as _e:
+        DEVICE = "cpu"
+        DEVICE_NAME = "PT (延迟加载)"
+        print(f"[inference] PT 依赖暂不可用, 延迟到 load_model 再导入: {_e}")
 else:
     # RKNN 后端: 不需要 torch/ultralytics
-    YOLO = None  # type: ignore
     DEVICE = "npu"
     DEVICE_NAME = "RK3588 NPU"
 
@@ -117,6 +123,20 @@ PRESETS = {
     "高准确度": {"conf": 0.6, "iou": 0.5, "desc": "只报最确定的, 不能误报场景"},
 }
 
+# SEG「最佳」模式: 每类独立 conf (部署调优值, 强类压误检 / 弱类抢召回). 类别索引见 CN_NAMES 顺序.
+PER_CLASS_CONF = {
+    0: 0.40,  # screw_cap 螺帽
+    1: 0.10,  # thin_rod  细杆
+    2: 0.10,  # stone     石块红砖
+    3: 0.10,  # leaf      树叶
+    4: 0.10,  # metal_debris 金属碎片
+    5: 0.40,  # metal     金属
+    6: 0.25,  # mian_xu   棉絮
+    7: 0.40,  # sls       透明塑料绳
+    8: 0.10,  # hemp_rope 麻绳
+    9: 0.10,  # hair      黑发
+}
+
 
 def conf_tier(c: float) -> tuple[str, str]:
     """返回 (中文档位, hex 颜色 - 科技感配色)"""
@@ -130,50 +150,89 @@ def conf_tier(c: float) -> tuple[str, str]:
 # ════════════════════════════════════════════════════
 # 模型单例 (惰性加载)
 # ════════════════════════════════════════════════════
-_MODEL = None  # PT: YOLO 实例; RKNN: RKNNLite 实例
+_MODEL = None  # PT: YOLO 实例; RKNN: RKNNLite / RKNN 实例
+_MODEL_TASK = None  # "obb" | "seg" — 由模型输出签名自动判定, 决定走哪套后处理
+_MODEL_BACKEND = None  # 当前实际后端 "pt" | "rknn"
+_CUR_PATH = None  # 当前已加载模型路径 (热切换比对用)
 _CLS_NAMES_LIST = list(CN_NAMES.keys())  # 类别索引 → 英文名
 
 
-def load_model():
-    """加载模型 (惰性), 在 splash 屏上调用"""
-    global _MODEL
-    if _MODEL is not None:
-        return _MODEL
-    assert MODEL_PATH.exists(), f"找不到模型文件: {MODEL_PATH}"
+def _detect_task_from_outputs(outs) -> str:
+    """按输出签名判 task: 有 proto(…,32,160,160)=seg; 否则(有 angle (1,1,8400))=obb."""
+    for o in outs:
+        a = np.asarray(o)
+        if a.ndim == 4 and a.shape[1] == 32 and a.shape[2] == 160:
+            return "seg"
+    return "obb"
 
-    if BACKEND == "rknn":
-        if RKNN_API_MODE == "lite":
-            # 真机: 直接 load .rknn → init NPU
-            from rknnlite.api import RKNNLite
-            _MODEL = RKNNLite()
-            if _MODEL.load_rknn(str(MODEL_PATH)) != 0:
-                raise RuntimeError(f"RKNN load_rknn 失败: {MODEL_PATH}")
-            if _MODEL.init_runtime() != 0:
-                raise RuntimeError("RKNN init_runtime 失败")
-        elif RKNN_API_MODE == "simulator":
-            # PC: 从 ONNX 重 build (启动 1-2 分钟, 仅用于开发验证)
-            from rknn.api import RKNN
-            _MODEL = RKNN(verbose=False)
-            calib = PROJECT_ROOT / "calib_list.txt"
-            _MODEL.config(
-                mean_values=[[0]], std_values=[[255]],
-                target_platform="rk3588",
-                quantized_dtype="asymmetric_quantized-8",
-                optimization_level=3,
-            )
-            print(f"[inference] RKNN simulator 启动中 (从 ONNX build, ~1 分钟)...")
-            if _MODEL.load_onnx(model=str(MODEL_PATH)) != 0:
-                raise RuntimeError("RKNN load_onnx 失败")
-            do_quant = calib.exists()
-            if _MODEL.build(do_quantization=do_quant,
-                            dataset=str(calib) if do_quant else None) != 0:
-                raise RuntimeError("RKNN build 失败")
-            if _MODEL.init_runtime(target=None) != 0:  # target=None = simulator
-                raise RuntimeError("RKNN init_runtime (simulator) 失败")
-            print(f"[inference] RKNN simulator 就绪")
-    else:
-        _MODEL = YOLO(str(MODEL_PATH))
-        _MODEL.to(DEVICE)
+
+def _rknn_dummy_outputs(model):
+    """跑一帧全 0 图, 拿输出 shape 用于判 task (一次性, ~百毫秒)."""
+    dummy = np.zeros((1, 640, 640, 1), dtype=np.uint8)
+    return model.inference(inputs=[dummy])
+
+
+def load_model(model_path=None, force: bool = False):
+    """加载模型 (惰性 / 热切换). 路径驱动 + 自动判 task.
+
+    model_path=None → 用启动检测到的默认 MODEL_PATH;
+    传新路径 → 释放旧模型, 按扩展名选后端 (.pt=PT / .rknn=lite / .onnx=simulator),
+    加载后用输出签名自动判 obb/seg, 不重启即生效.
+    """
+    global _MODEL, _MODEL_TASK, _MODEL_BACKEND, _CUR_PATH
+    path = Path(model_path) if model_path else MODEL_PATH
+    if _MODEL is not None and not force and str(path) == str(_CUR_PATH):
+        return _MODEL
+    assert path.exists(), f"找不到模型文件: {path}"
+
+    # 释放旧模型 (热切换)
+    if _MODEL is not None:
+        try:
+            _MODEL.release()
+        except Exception:
+            pass
+        _MODEL = None
+
+    ext = path.suffix.lower()
+    if ext == ".pt":
+        import torch
+        local_ultra = PROJECT_ROOT / "ultralytics"
+        if local_ultra.exists() and str(local_ultra) not in sys.path:
+            sys.path.insert(0, str(local_ultra))
+        from ultralytics import YOLO as _YOLO
+        dev = "cuda" if torch.cuda.is_available() else "cpu"
+        _MODEL = _YOLO(str(path)); _MODEL.to(dev)
+        _MODEL_BACKEND = "pt"
+        _MODEL_TASK = "seg" if getattr(_MODEL, "task", "") == "segment" else "obb"
+    elif ext == ".rknn":
+        # 真机: RKNNLite 直接 load .rknn → init NPU
+        from rknnlite.api import RKNNLite
+        _MODEL = RKNNLite()
+        if _MODEL.load_rknn(str(path)) != 0:
+            raise RuntimeError(f"RKNN load_rknn 失败: {path}")
+        if _MODEL.init_runtime() != 0:
+            raise RuntimeError("RKNN init_runtime 失败")
+        _MODEL_BACKEND = "rknn"
+        _MODEL_TASK = _detect_task_from_outputs(_rknn_dummy_outputs(_MODEL))
+    else:  # .onnx → PC simulator (从 ONNX 重 build, 仅开发验证)
+        from rknn.api import RKNN
+        _MODEL = RKNN(verbose=False)
+        calib = PROJECT_ROOT / "calib_list.txt"
+        _MODEL.config(mean_values=[[0]], std_values=[[255]], target_platform="rk3588",
+                      quantized_dtype="asymmetric_quantized-8", optimization_level=3)
+        print("[inference] RKNN simulator 启动中 (从 ONNX build, ~1 分钟)...")
+        if _MODEL.load_onnx(model=str(path)) != 0:
+            raise RuntimeError("RKNN load_onnx 失败")
+        do_quant = calib.exists()
+        if _MODEL.build(do_quantization=do_quant, dataset=str(calib) if do_quant else None) != 0:
+            raise RuntimeError("RKNN build 失败")
+        if _MODEL.init_runtime(target=None) != 0:
+            raise RuntimeError("RKNN init_runtime (simulator) 失败")
+        _MODEL_BACKEND = "rknn"
+        _MODEL_TASK = _detect_task_from_outputs(_rknn_dummy_outputs(_MODEL))
+
+    _CUR_PATH = path
+    print(f"[inference] 已加载: {path.name}  后端={_MODEL_BACKEND}  任务={_MODEL_TASK}")
     return _MODEL
 
 
@@ -181,6 +240,12 @@ def get_model():
     if _MODEL is None:
         return load_model()
     return _MODEL
+
+
+def get_task() -> str:
+    if _MODEL is None:
+        load_model()
+    return _MODEL_TASK
 
 
 # ════════════════════════════════════════════════════
@@ -370,12 +435,137 @@ def _rknn_predict_obb(
 
 
 # ════════════════════════════════════════════════════
+# SEG 后处理: 方案② 7 截断输出 → DFL 解码 + 轴对齐NMS + mask 组装
+#   与 OBB 共享 _make_anchors / _softmax / _sigmoid / _REG_MAX / _NC / _IMGSZ
+# ════════════════════════════════════════════════════
+_PROTO = 160
+
+
+def _box_iou(a: np.ndarray, bs: np.ndarray) -> np.ndarray:
+    ix1 = np.maximum(a[0], bs[:, 0]); iy1 = np.maximum(a[1], bs[:, 1])
+    ix2 = np.minimum(a[2], bs[:, 2]); iy2 = np.minimum(a[3], bs[:, 3])
+    iw = np.clip(ix2 - ix1, 0, None); ih = np.clip(iy2 - iy1, 0, None)
+    inter = iw * ih
+    aa = (a[2] - a[0]) * (a[3] - a[1]); bb = (bs[:, 2] - bs[:, 0]) * (bs[:, 3] - bs[:, 1])
+    return inter / (aa + bb - inter + 1e-9)
+
+
+def _axis_nms(boxes: np.ndarray, scores: np.ndarray, thr: float) -> list[int]:
+    idx = scores.argsort()[::-1]; keep = []
+    while len(idx):
+        i = idx[0]; keep.append(int(i))
+        if len(idx) == 1:
+            break
+        rest = idx[1:]
+        ov = _box_iou(boxes[i], boxes[rest])
+        idx = rest[ov < thr]
+    return keep
+
+
+def _decode_seg_outputs(outs):
+    """7 截断输出 (按 shape 识别, 不依赖顺序) → xyxy(8400,4)/cls(8400,10)/coef(8400,32)/proto(32,25600)."""
+    heads, coefs, proto = {}, {}, None
+    for o in outs:
+        a = np.asarray(o)
+        if a.ndim == 4 and a.shape[1] == 32 and a.shape[2] == _PROTO:
+            proto = a[0].reshape(32, -1)                # (32, 25600)
+        elif a.ndim == 4 and a.shape[1] == 74:
+            heads[a.shape[2]] = a                        # box+cls, 按 H
+        elif a.ndim == 4 and a.shape[1] == 32:
+            coefs[a.shape[2]] = a                        # mask 系数, 按 H
+    _make_anchors()
+    dists, clss, coefl = [], [], []
+    for H in (80, 40, 20):                               # stride 8/16/32
+        head = heads[H]
+        bs, _, h, w = head.shape; N = h * w
+        box_reg = head[:, :4 * _REG_MAX].reshape(bs, 4, _REG_MAX, N)
+        cls_log = head[:, 4 * _REG_MAX:].reshape(bs, _NC, N)
+        box_reg = _softmax(box_reg, axis=2)
+        wts = np.arange(_REG_MAX, dtype=np.float32).reshape(1, 1, _REG_MAX, 1)
+        dists.append((box_reg * wts).sum(axis=2))        # (1,4,N)
+        clss.append(cls_log)
+        coefl.append(coefs[H].reshape(bs, 32, N))
+    dist = np.concatenate(dists, -1)                     # (1,4,8400)
+    cls_log = np.concatenate(clss, -1)                   # (1,10,8400)
+    coef = np.concatenate(coefl, -1)                     # (1,32,8400)
+    st = _STRIDE_T[None, None, :]
+    ax = _ANCHORS_XY[:, 0][None, None]; ay = _ANCHORS_XY[:, 1][None, None]
+    l, t, r, b = dist[:, 0:1], dist[:, 1:2], dist[:, 2:3], dist[:, 3:4]
+    x1, y1 = ax - l * st, ay - t * st
+    x2, y2 = ax + r * st, ay + b * st
+    xyxy = np.concatenate([x1, y1, x2, y2], 1)[0].T      # (8400,4)
+    cls = _sigmoid(cls_log)[0].T                         # (8400,10)
+    coef = coef[0].T                                     # (8400,32)
+    return xyxy, cls, coef, proto
+
+
+def _rknn_predict_seg(gray_hw1: np.ndarray, conf_th: float, iou_th: float, per_class: bool = False):
+    """RKNN seg 推理 + 后处理. per_class=True 用 PER_CLASS_CONF 每类卡阈值(最佳模式),
+    否则用全局 conf_th. 返回 (boxes_4pts轴对齐(原图), cls_ids, confs, masks(原图bool))."""
+    rknn = get_model()
+    orig_h, orig_w = gray_hw1.shape[:2]
+    scale = _IMGSZ / max(orig_h, orig_w)
+    new_w, new_h = int(round(orig_w * scale)), int(round(orig_h * scale))
+    resized = cv2.resize(gray_hw1[:, :, 0], (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+    pad_w, pad_h = _IMGSZ - new_w, _IMGSZ - new_h
+    top, left = pad_h // 2, pad_w // 2
+    canvas = np.full((_IMGSZ, _IMGSZ), 114, dtype=np.uint8)
+    canvas[top:top + new_h, left:left + new_w] = resized
+
+    outs = rknn.inference(inputs=[canvas[None, :, :, None]])
+    xyxy, cls, coef, proto = _decode_seg_outputs(outs)
+
+    cls_ids = cls.argmax(1); confs = cls.max(1)
+    if per_class:
+        thr = np.array([PER_CLASS_CONF.get(int(c), conf_th) for c in cls_ids])
+        keep = confs >= thr
+    else:
+        keep = confs >= conf_th
+    empty = (np.zeros((0, 4, 2), np.float32), np.zeros(0, int), np.zeros(0), [])
+    if keep.sum() == 0:
+        return empty
+    xyxy, cls_ids, confs, coef = xyxy[keep], cls_ids[keep], confs[keep], coef[keep]
+
+    # 逐类轴对齐 NMS
+    final = []
+    for c in np.unique(cls_ids):
+        m = np.where(cls_ids == c)[0]
+        for k in _axis_nms(xyxy[m], confs[m], iou_th):
+            final.append(int(m[k]))
+    if not final:
+        return empty
+    final = np.array(final, int)
+    xyxy, cls_ids, confs, coef = xyxy[final], cls_ids[final], confs[final], coef[final]
+
+    # mask 组装 (160) → 640 letterbox → 去 pad → 原图
+    boxes_pts, masks = [], []
+    r4 = _IMGSZ / _PROTO
+    for i in range(len(final)):
+        mk = _sigmoid(coef[i] @ proto).reshape(_PROTO, _PROTO)
+        bx = (xyxy[i] / r4).astype(int)
+        X1, Y1 = max(bx[0], 0), max(bx[1], 0)
+        X2, Y2 = min(bx[2], _PROTO), min(bx[3], _PROTO)
+        mb = np.zeros((_PROTO, _PROTO), np.uint8)
+        if X2 > X1 and Y2 > Y1:
+            mb[Y1:Y2, X1:X2] = (mk[Y1:Y2, X1:X2] > 0.5).astype(np.uint8)
+        m640 = cv2.resize(mb, (_IMGSZ, _IMGSZ), interpolation=cv2.INTER_NEAREST)
+        m_nopad = m640[top:top + new_h, left:left + new_w]
+        m_orig = cv2.resize(m_nopad, (orig_w, orig_h), interpolation=cv2.INTER_NEAREST).astype(bool)
+        masks.append(m_orig)
+        x1, y1, x2, y2 = xyxy[i]
+        x1 = (x1 - left) / scale; x2 = (x2 - left) / scale
+        y1 = (y1 - top) / scale; y2 = (y2 - top) / scale
+        boxes_pts.append(np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], np.float32))
+    return np.array(boxes_pts, np.float32), cls_ids, confs, masks
+
+
+# ════════════════════════════════════════════════════
 # 同类重叠框合并
 # ════════════════════════════════════════════════════
 def merge_same_class_overlap(
-    boxes: np.ndarray, cls_ids: np.ndarray, confs: np.ndarray
+    boxes: np.ndarray, cls_ids: np.ndarray, confs: np.ndarray, axis_aligned: bool = False
 ) -> tuple[list[np.ndarray], list[int], list[float], list[int]]:
-    """同类任何接触即合并为最小外接旋转矩形"""
+    """同类任何接触即合并. axis_aligned=False→最小外接旋转矩形(OBB); True→轴对齐外接正框(seg)."""
     N = len(boxes)
     if N == 0:
         return [], [], [], []
@@ -448,8 +638,13 @@ def merge_same_class_overlap(
                 pts = np.concatenate(
                     [boxes[indices[ii]] for ii in grp], axis=0
                 ).astype(np.float32)
-                rect = cv2.minAreaRect(pts)
-                merged_pts = cv2.boxPoints(rect)
+                if axis_aligned:
+                    x1, y1 = pts[:, 0].min(), pts[:, 1].min()
+                    x2, y2 = pts[:, 0].max(), pts[:, 1].max()
+                    merged_pts = np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], np.float32)
+                else:
+                    rect = cv2.minAreaRect(pts)
+                    merged_pts = cv2.boxPoints(rect)
                 out_boxes.append(merged_pts)
                 out_cls.append(cid)
                 out_confs.append(max(float(confs[indices[ii]]) for ii in grp))
@@ -487,11 +682,21 @@ def draw_annotations(
     cls_names_eng: list[str],
     confs: list[float],
     sizes: list[int],
+    masks: list[np.ndarray] | None = None,
+    mask_cls_eng: list[str] | None = None,
 ) -> np.ndarray:
-    """用 OpenCV 画框 + PIL 写中文标签"""
+    """用 OpenCV 画框 + PIL 写中文标签. seg 传 masks(原图bool, 各画各)则先叠半透明掩膜."""
     out = img_bgr.copy()
     h, w = img_bgr.shape[:2]
     short_edge = min(h, w)
+
+    # 0. seg: 叠半透明 mask (各画各的, 不并)
+    if masks:
+        overlay = out.copy()
+        for mk, eng in zip(masks, mask_cls_eng or cls_names_eng):
+            color = CLASS_COLORS_BGR.get(eng, (0, 255, 0))
+            overlay[mk] = color
+        cv2.addWeighted(overlay, 0.45, out, 0.55, 0, out)
 
     # 1. 画框 (OpenCV)
     for box, cls_eng, sz in zip(boxes, cls_names_eng, sizes):
@@ -564,6 +769,7 @@ def run_inference(image_rgb: np.ndarray, mode: str = "标准", skip_draw: bool =
     t_start = time.perf_counter()
     cfg = PRESETS.get(mode, PRESETS["标准"])
     conf_th, iou_th = cfg["conf"], cfg["iou"]
+    per_class = bool(cfg.get("per_class", False))  # SEG「最佳」模式: 每类阈值
 
     # 记录原始图像信息 (缩放前)
     orig_h, orig_w = image_rgb.shape[:2]
@@ -597,11 +803,15 @@ def run_inference(image_rgb: np.ndarray, mode: str = "标准", skip_draw: bool =
         "inference_time": 0.0,  # 占位, 下面覆盖
     }
 
-    # ── 后端分发 ──
-    if BACKEND == "rknn":
-        raw_boxes, raw_cls, raw_confs = _rknn_predict_obb(gray_1ch, conf_th, iou_th)
+    # ── 后端 + 任务分发 (task 由模型输出签名自动判, 选模型即自动切后处理) ──
+    task = get_task()          # 触发加载 + 判 obb/seg
+    raw_masks = None           # seg 专用: 各实例 mask (原图 bool)
+    if _MODEL_BACKEND == "rknn":
+        if task == "seg":
+            raw_boxes, raw_cls, raw_confs, raw_masks = _rknn_predict_seg(gray_1ch, conf_th, iou_th, per_class=per_class)
+        else:
+            raw_boxes, raw_cls, raw_confs = _rknn_predict_obb(gray_1ch, conf_th, iou_th)
         raw_n = len(raw_boxes)
-        # 类别索引 → 英文名映射 (RKNN 没有 names dict, 用全局 _CLS_NAMES_LIST)
         eng_lookup = {i: name for i, name in enumerate(_CLS_NAMES_LIST)}
     else:
         model = get_model()
@@ -610,17 +820,48 @@ def run_inference(image_rgb: np.ndarray, mode: str = "标准", skip_draw: bool =
             device=DEVICE, verbose=False,
         )
         r = results[0]
-        if r.obb is None or len(r.obb) == 0:
-            raw_boxes = np.zeros((0, 4, 2), dtype=np.float32)
-            raw_cls = np.zeros(0, dtype=int)
-            raw_confs = np.zeros(0)
-            raw_n = 0
+        if task == "seg":
+            if r.masks is None or r.boxes is None or len(r.boxes) == 0:
+                raw_boxes = np.zeros((0, 4, 2), np.float32); raw_cls = np.zeros(0, int)
+                raw_confs = np.zeros(0); raw_masks = []; raw_n = 0
+            else:
+                xy = r.boxes.xyxy.cpu().numpy()
+                raw_boxes = np.stack([xy[:, [0, 1]], xy[:, [2, 1]], xy[:, [2, 3]], xy[:, [0, 3]]], 1).astype(np.float32)
+                raw_cls = r.boxes.cls.cpu().numpy().astype(int)
+                raw_confs = r.boxes.conf.cpu().numpy()
+                raw_masks = []
+                for poly in r.masks.xy:        # 原图坐标多边形 → 栅格化
+                    mm = np.zeros((h, w), np.uint8)
+                    if len(poly) >= 3:
+                        cv2.fillPoly(mm, [poly.astype(np.int32)], 1)
+                    raw_masks.append(mm.astype(bool))
+                raw_n = len(raw_boxes)
         else:
-            raw_boxes = r.obb.xyxyxyxy.cpu().numpy()
-            raw_cls = r.obb.cls.cpu().numpy().astype(int)
-            raw_confs = r.obb.conf.cpu().numpy()
-            raw_n = len(raw_boxes)
+            if r.obb is None or len(r.obb) == 0:
+                raw_boxes = np.zeros((0, 4, 2), dtype=np.float32)
+                raw_cls = np.zeros(0, dtype=int)
+                raw_confs = np.zeros(0)
+                raw_n = 0
+            else:
+                raw_boxes = r.obb.xyxyxyxy.cpu().numpy()
+                raw_cls = r.obb.cls.cpu().numpy().astype(int)
+                raw_confs = r.obb.conf.cpu().numpy()
+                raw_n = len(raw_boxes)
         eng_lookup = r.names if raw_n > 0 else {i: n for i, n in enumerate(_CLS_NAMES_LIST)}
+
+    # 技术员「检测项开关」: 禁检类别在此(画框/烤 mask 之前)整条滤掉 ——
+    # 这样 seg 的 mask 也不会烤进底图(只在界面层丢 detections 是去不掉已烤好的 mask 的)。
+    drop = cfg.get("drop_classes")
+    if drop and raw_n:
+        keep = [i for i in range(raw_n)
+                if CN_NAMES.get(eng_lookup[int(raw_cls[i])], eng_lookup[int(raw_cls[i])]) not in drop]
+        if len(keep) != raw_n:
+            raw_boxes = raw_boxes[keep] if len(keep) else np.zeros((0, 4, 2), np.float32)
+            raw_cls = raw_cls[keep] if len(keep) else np.zeros(0, int)
+            raw_confs = raw_confs[keep] if len(keep) else np.zeros(0)
+            if raw_masks is not None:
+                raw_masks = [raw_masks[i] for i in keep]
+            raw_n = len(keep)
 
     if raw_n == 0:
         common["inference_time"] = time.perf_counter() - t_start
@@ -629,19 +870,33 @@ def run_inference(image_rgb: np.ndarray, mode: str = "标准", skip_draw: bool =
             "detections": [],
             "raw_count": 0,
             "final_count": 0,
+            "task": task,
             **common,
         }
 
+    # seg 合成轴对齐正框; obb 合成旋转框 (mask 各画各, 不并)
     boxes, cls_ids, confs, sizes = merge_same_class_overlap(
-        raw_boxes, raw_cls, raw_confs
+        raw_boxes, raw_cls, raw_confs, axis_aligned=(task == "seg")
     )
     cls_names_eng = [eng_lookup[int(c)] for c in cls_ids]
 
-    # 跳过画框: UI 自己用 ObbOverlay 渲染框, 省 10-80ms PIL/cv2 开销
+    # 跳过画框: UI 用 overlay 自己画框, 省 PIL/cv2 开销
+    #   seg 例外: 即使 skip_draw 也要把 mask 叠进底图 (框仍交给 overlay), 否则 mask 不显示
     if skip_draw:
-        annotated_rgb = image_rgb
+        if task == "seg" and raw_masks:
+            mask_eng = [eng_lookup[int(c)] for c in raw_cls]
+            annotated_bgr = draw_annotations(img_bgr, [], [], [], [],
+                                             masks=raw_masks, mask_cls_eng=mask_eng)
+            annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
+        else:
+            annotated_rgb = image_rgb
     else:
-        annotated_bgr = draw_annotations(img_bgr, boxes, cls_names_eng, confs, sizes)
+        if task == "seg" and raw_masks:
+            mask_eng = [eng_lookup[int(c)] for c in raw_cls]
+            annotated_bgr = draw_annotations(img_bgr, boxes, cls_names_eng, confs, sizes,
+                                             masks=raw_masks, mask_cls_eng=mask_eng)
+        else:
+            annotated_bgr = draw_annotations(img_bgr, boxes, cls_names_eng, confs, sizes)
         annotated_rgb = cv2.cvtColor(annotated_bgr, cv2.COLOR_BGR2RGB)
 
     # 计算面积占比 + 写入 points (UI overlay 直接用)
@@ -670,5 +925,6 @@ def run_inference(image_rgb: np.ndarray, mode: str = "标准", skip_draw: bool =
         "raw_count": raw_n,
         "final_count": len(boxes),
         "total_area_ratio": total_area / img_area if img_area > 0 else 0.0,
+        "task": task,
         **common,
     }

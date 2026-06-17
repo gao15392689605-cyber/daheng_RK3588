@@ -4,7 +4,10 @@ from __future__ import annotations
 import math
 
 from PySide6.QtCore import QPointF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtGui import (
+    QBrush, QColor, QFont, QLinearGradient, QPainter, QPainterPath, QPen,
+    QRadialGradient,
+)
 from PySide6.QtWidgets import (
     QDialog, QFileDialog, QFormLayout, QFrame, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPushButton, QVBoxLayout, QWidget,
@@ -40,34 +43,106 @@ _LINK_QSS = (
 
 
 class _LogoCircle(QWidget):
-    """登录页左侧圆形 logo: 浅蓝渐变圆 + 中央三根烟草条"""
+    """登录页圆形 logo — 科技 HUD 风:
+    深色底 + 霓虹青蓝刻度环 + 细线烟叶轮廓 + 检测框四角 + 扫描线 + 命中节点。
+    """
+
+    _CYAN = QColor(46, 230, 255)
+    _BLUE = QColor(45, 140, 254)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
         self.setFixedSize(220, 220)
 
     def paintEvent(self, _e) -> None:  # noqa: N802
+        import math
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        cx, cy = w / 2, h / 2
-        r = min(w, h) / 2 - 6
+        cx, cy = w / 2.0, h / 2.0
+        r = min(w, h) / 2.0 - 6
+        cyan, blue = self._CYAN, self._BLUE
 
-        # 圆形浅蓝底
-        p.setPen(QPen(QColor(120, 170, 230, 200), 2))
-        p.setBrush(QColor(220, 235, 250))
+        # ── 深色圆底(径向) ──
+        bg = QRadialGradient(cx, cy * 0.85, r * 1.25)
+        bg.setColorAt(0.0, QColor(22, 38, 60))
+        bg.setColorAt(1.0, QColor(10, 17, 30))
+        p.setPen(Qt.NoPen); p.setBrush(QBrush(bg))
         p.drawEllipse(QPointF(cx, cy), r, r)
 
-        # 中央三根烟条 (角度略错开)
-        p.setBrush(QColor(180, 190, 200))
-        p.setPen(QPen(QColor(140, 150, 160), 1))
-        bar_w, bar_h = 22, 90
-        for i, ang_deg in enumerate((-12, 0, 12)):
-            p.save()
-            p.translate(cx + (i - 1) * 24, cy)
-            p.rotate(ang_deg)
-            p.drawRoundedRect(-bar_w / 2, -bar_h / 2, bar_w, bar_h, 4, 4)
-            p.restore()
+        # ── 外发光环 + 主环(青→蓝渐变) ──
+        ring_grad = QLinearGradient(cx - r, cy - r, cx + r, cy + r)
+        ring_grad.setColorAt(0.0, cyan); ring_grad.setColorAt(1.0, blue)
+        p.setBrush(Qt.NoBrush)
+        p.setPen(QPen(QColor(46, 230, 255, 45), 7))           # 外发光
+        p.drawEllipse(QPointF(cx, cy), r - 4, r - 4)
+        p.setPen(QPen(QBrush(ring_grad), 2.4))                # 主环
+        p.drawEllipse(QPointF(cx, cy), r - 4, r - 4)
+
+        # ── HUD 刻度(环上短线, 长短交替) ──
+        p.save(); p.translate(cx, cy)
+        for i in range(60):
+            ang = math.radians(i * 6)
+            long = (i % 5 == 0)
+            r1 = r - 4
+            r2 = r - (13 if long else 8)
+            p.setPen(QPen(QColor(46, 230, 255, 150 if long else 70), 1.4 if long else 1.0))
+            p.drawLine(QPointF(math.cos(ang) * r2, math.sin(ang) * r2),
+                       QPointF(math.cos(ang) * r1, math.sin(ang) * r1))
+        # 顶部一段高亮弧(像扫描进度)
+        p.setPen(QPen(cyan, 2.6, Qt.SolidLine, Qt.RoundCap))
+        p.drawArc(int(-(r - 4)), int(-(r - 4)), int((r - 4) * 2), int((r - 4) * 2), 55 * 16, 70 * 16)
+        p.restore()
+
+        # ── 细线烟叶轮廓(倾斜, 半透明青色填充 + 描边) ──
+        p.save()
+        p.translate(cx - r * 0.04, cy)
+        p.rotate(-20)
+        ll, lw = r * 0.62, r * 0.32
+        leaf = QPainterPath()
+        leaf.moveTo(0, -ll)
+        leaf.cubicTo(lw, -ll * 0.45, lw, ll * 0.5, 0, ll)
+        leaf.cubicTo(-lw, ll * 0.5, -lw, -ll * 0.45, 0, -ll)
+        fill = QLinearGradient(-lw, -ll, lw, ll)
+        fill.setColorAt(0.0, QColor(46, 230, 255, 38))
+        fill.setColorAt(1.0, QColor(45, 140, 254, 22))
+        p.setBrush(QBrush(fill))
+        p.setPen(QPen(cyan, 1.8))
+        p.drawPath(leaf)
+        # 主叶脉 + 斜向侧脉(细线)
+        p.setPen(QPen(QColor(46, 230, 255, 170), 1.2))
+        p.drawLine(QPointF(0, -ll * 0.9), QPointF(0, ll * 0.9))
+        for t in (-0.4, -0.05, 0.3):
+            y = ll * t; side = lw * (1 - abs(t)) * 0.8
+            p.drawLine(QPointF(0, y), QPointF(side, y + ll * 0.14))
+            p.drawLine(QPointF(0, y), QPointF(-side, y + ll * 0.14))
+        p.restore()
+
+        # ── 检测框四角(targeting brackets, 框住叶子) ──
+        bs = r * 0.62          # 半边长
+        arm = r * 0.16         # 角臂长
+        p.setPen(QPen(cyan, 2.2, Qt.SolidLine, Qt.RoundCap))
+        for sx, sy in ((-1, -1), (1, -1), (1, 1), (-1, 1)):
+            x, y = cx + sx * bs, cy + sy * bs
+            p.drawLine(QPointF(x, y), QPointF(x - sx * arm, y))
+            p.drawLine(QPointF(x, y), QPointF(x, y - sy * arm))
+
+        # ── 扫描线(横向, 中部, 两端渐隐) ──
+        sy = cy - r * 0.12
+        scan = QLinearGradient(cx - bs, sy, cx + bs, sy)
+        scan.setColorAt(0.0, QColor(46, 230, 255, 0))
+        scan.setColorAt(0.5, QColor(46, 230, 255, 220))
+        scan.setColorAt(1.0, QColor(46, 230, 255, 0))
+        p.setPen(QPen(QBrush(scan), 2.0))
+        p.drawLine(QPointF(cx - bs, sy), QPointF(cx + bs, sy))
+
+        # ── 命中节点(小方块 + 外环, 像被识别框中的目标点) ──
+        for dx, dy in ((0.22, 0.30), (-0.28, 0.12)):
+            nx, ny = cx + r * dx, cy + r * dy
+            p.setPen(QPen(QColor(46, 230, 255, 120), 1.2)); p.setBrush(Qt.NoBrush)
+            p.drawEllipse(QPointF(nx, ny), r * 0.06, r * 0.06)
+            p.setPen(Qt.NoPen); p.setBrush(cyan)
+            p.drawRect(int(nx - r * 0.018), int(ny - r * 0.018), int(r * 0.036), int(r * 0.036))
 
 
 class LoginWindow(QWidget):
@@ -168,15 +243,11 @@ class LoginWindow(QWidget):
         self.login_btn.clicked.connect(self._do_login)
         lay.addWidget(self.login_btn)
 
-        self.register_btn = QPushButton("注册账号")
-        self.register_btn.setMinimumHeight(42)
-        self.register_btn.setStyleSheet(
-            f"QPushButton {{ background:transparent; color:{COLOR_TEXT};"
-            f"border:1px solid {COLOR_BTN_PRIMARY}; border-radius:4px; font-size:13px; }}"
-            f"QPushButton:hover {{ background:{COLOR_BTN_PRIMARY}; color:white; }}"
-        )
-        self.register_btn.clicked.connect(self._open_register)
-        lay.addWidget(self.register_btn)
+        # 去掉自助注册:账号统一由管理员开通(见角色分层方案)
+        hint = QLabel("账号由管理员开通 · 忘记密码请联系管理员")
+        hint.setStyleSheet(f"color:{COLOR_TEXT_DIM}; font-size:12px;")
+        hint.setAlignment(Qt.AlignCenter)
+        lay.addWidget(hint)
 
         lay.addStretch()
 
@@ -206,9 +277,14 @@ class LoginWindow(QWidget):
             return
 
         u = DbHelper.instance().get_user(user) or {}
+        if not u.get("active", 1):
+            QMessageBox.warning(self, "提示", "账号已停用,请联系管理员")
+            return
         state.username = user
         state.avatar_path = u.get("avatar_path", "")
-        log.info("用户登录: %s", user)
+        state.role = u.get("role", "worker")
+        log.info("用户登录: %s (role=%s)", user, state.role)
+        # 首次登录改密提示已彻底去掉(原实现反复弹, 体验差)
         self.login_success.emit(user)
 
     def _open_register(self) -> None:

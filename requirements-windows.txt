@@ -1,0 +1,43 @@
+# 烟草异物智能检测系统 — Windows 桌面调试依赖清单 (PT 模式, CPU 一键装)
+#
+# 适用场景: 在 Windows (无 NPU) 上做跨平台验证。推理后端自动回退到 PT (PyTorch),
+# 模型用 model/best.pt; 启动时终端打印 "[inference] 后端: PT  设备: CPU" 即正常。
+#
+# 要求: Python 3.10+, 建议单独 venv, 切勿装进 RK3588 环境。
+#
+# ★ 先决条件 (必须先做, 否则装不上):
+#   把你"改版的灰度 ultralytics 源码"整个文件夹放到项目根目录下的  ./ultralytics/
+#   (即 tobacco_detection_system/ultralytics/, 里面要有 pyproject.toml)。
+#   模型是单通道灰度 OBB, 必须用你这份改版源码, 标准 PyPI 版会因通道不符出错。
+#
+# ★ 一键安装 (在项目根目录执行):
+#   python -m venv venv
+#   venv\Scripts\activate
+#   pip install -r requirements-windows.txt
+#   下面的 -e ./ultralytics 会把"你的改版源码"装成 ultralytics 包(优先生效),
+#   并自动拉齐 torch / torchvision / numpy / opencv / Pillow 等全部依赖(Windows 默认 CPU 版)。
+
+# ── PT 后端 = 你的改版灰度 ultralytics 源码 (editable, 自动带齐 torch 等依赖) ──
+-e ./ultralytics
+
+# ── ultralytics 不包含、本项目额外需要的依赖 ──
+PySide6==6.6.1
+shapely>=2.0.0
+
+# ════════════════════════════════════════════════════════════
+# 可选项 (一键装完不需要也能跑照片/视频/文件夹检测)
+# ════════════════════════════════════════════════════════════
+#
+# 可选 1 — GPU 加速 (你电脑有 N 卡 + CUDA 时):
+#   一键装完后, 用本机 CUDA 版替换默认的 CPU 版 torch
+#   (cuXXX 选 <= nvidia-smi 右上角显示的 CUDA 版本, 向下兼容):
+#     pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --upgrade
+#   成功后启动显示 "设备: GPU (你的显卡)"。torch 跟机器走, 故不写死进清单。
+#
+# 可选 2 — 工业相机 (仅"相机模式"需要):
+#   gxipy 不在 PyPI、Windows 也无内置驱动 → 不能 pip 装。
+#   去大恒图像官网下载 "Galaxy SDK (Windows 版)", 安装时勾选 "Python (gxipy)" 组件
+#   (一并装好 USB 驱动 + GxIAPI 运行库 + gxipy), 相机插 USB3.0 口即可用。
+#   不装则相机模式提示"相机不可用", 不影响照片/视频/文件夹检测。
+#
+# ⚠️ RK3588 部署严禁安装本清单 (torch/ultralytics 违背 <800MB 轻量化, 用 requirements-rk3588.txt)。

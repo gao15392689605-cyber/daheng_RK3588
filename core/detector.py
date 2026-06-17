@@ -61,11 +61,18 @@ class DetectionWorker(QThread):
         self._running = True
         self._paused = False
         self._mutex = QMutex()
+        self._last_raw: np.ndarray | None = None   # 最近一帧"干净原图"(无框), 供拍摄取用
         # 推理参数 (运行时可改)
         self.conf = state.conf_threshold
         self.iou = state.iou_threshold
+        self.per_class = state.best_mode      # SEG「最佳」模式
         # 视频跳帧: 每 (skip+1) 帧推理 1 次, 0 = 不跳
         self.frame_skip = 0
+
+    def latest_raw(self) -> "np.ndarray | None":
+        """最近一帧干净原图(无检测框)的副本; 拍摄推理用, 避免拿到画了框的图。"""
+        with QMutexLocker(self._mutex):
+            return None if self._last_raw is None else self._last_raw.copy()
 
     def stop(self) -> None:
         with QMutexLocker(self._mutex):
@@ -75,10 +82,12 @@ class DetectionWorker(QThread):
         with QMutexLocker(self._mutex):
             self._paused = paused
 
-    def update_thresholds(self, conf: float, iou: float) -> None:
+    def update_thresholds(self, conf: float, iou: float, per_class: bool | None = None) -> None:
         with QMutexLocker(self._mutex):
             self.conf = conf
             self.iou = iou
+            if per_class is not None:
+                self.per_class = per_class
 
     def _is_running(self) -> bool:
         with QMutexLocker(self._mutex):
@@ -97,15 +106,31 @@ class DetectionWorker(QThread):
             idx = 0
             # 相机模式: read 超时是正常的(暂时没帧), 不能当作"读取结束"
             is_stream = self.source.total == -1
+            was_paused = False
             while self._is_running():
                 if self._is_paused():
+                    was_paused = True
                     self.msleep(50)
                     continue
+
+                # 刚从暂停恢复: 摄像头丢弃缓冲区积压的旧帧 —— 暂停期间相机流未停,
+                # 缓冲里是调曝光前的旧亮度帧, 不丢的话继续后第一帧仍是旧曝光.
+                # 丢几帧后取到的才是调曝光后产生的新帧, 让继续即时反映新亮度.
+                if was_paused:
+                    was_paused = False
+                    if is_stream:
+                        for _ in range(3):
+                            if not self._is_running() or self._is_paused():
+                                break
+                            self.source.read()  # 取出即丢弃
 
                 ok, frame_rgb = self.source.read()
                 # stop 信号可能在 read 阻塞期间被设
                 if not self._is_running():
                     break
+                if ok and frame_rgb is not None:
+                    with QMutexLocker(self._mutex):
+                        self._last_raw = frame_rgb   # 存干净原帧, 供拍摄取用
                 if not ok or frame_rgb is None:
                     if is_stream:
                         self.msleep(10)  # 相机超时, 重试
@@ -124,8 +149,10 @@ class DetectionWorker(QThread):
 
                 try:
                     with QMutexLocker(self._mutex):
-                        conf, iou = self.conf, self.iou
-                    result = run_inference_runtime(frame_rgb, conf, iou)
+                        conf, iou, per_class = self.conf, self.iou, self.per_class
+                    # 禁检类别(技术员检测项开关)在推理层就滤掉, seg mask 也不会画出
+                    result = run_inference_runtime(frame_rgb, conf, iou, per_class=per_class,
+                                                   drop_classes=set(state.disabled_classes))
                 except Exception as e:
                     log.error("推理失败: %s", e)
                     self.error.emit(f"推理失败: {e}")
@@ -152,6 +179,157 @@ class DetectionWorker(QThread):
                 self.source.close()
             except Exception:
                 pass
+
+
+class _LatestFrame:
+    """共享槽: 预览线程写入最新帧, 推理线程取最新帧(自带序号, 避免重复推同一帧)。"""
+
+    def __init__(self) -> None:
+        self._m = QMutex()
+        self._frame: np.ndarray | None = None
+        self._seq = 0
+
+    def put(self, frame: np.ndarray) -> None:
+        with QMutexLocker(self._m):
+            self._frame = frame
+            self._seq += 1
+
+    def get(self) -> tuple[np.ndarray | None, int]:
+        with QMutexLocker(self._m):
+            return self._frame, self._seq
+
+
+class CameraPreviewWorker(QThread):
+    """相机预览线程 — 唯一持有相机, 持续读流 + 高帧率显示, 并把最新帧塞进共享槽。
+
+    不做推理(那是 CameraInferenceWorker 的事), 所以画面能按相机原速流畅刷新。
+    """
+
+    preview_ready = Signal(object)   # 原始 RGB 帧, 仅供显示
+    error = Signal(str)
+    finished_clean = Signal(str)
+
+    def __init__(self, source: BaseSource, slot: _LatestFrame, parent=None) -> None:
+        super().__init__(parent)
+        self.source = source
+        self.slot = slot
+        self._running = True
+        self._paused = False
+        self._mutex = QMutex()
+
+    def stop(self) -> None:
+        with QMutexLocker(self._mutex):
+            self._running = False
+
+    def set_paused(self, paused: bool) -> None:
+        with QMutexLocker(self._mutex):
+            self._paused = paused
+
+    def _is_running(self) -> bool:
+        with QMutexLocker(self._mutex):
+            return self._running
+
+    def _is_paused(self) -> bool:
+        with QMutexLocker(self._mutex):
+            return self._paused
+
+    def run(self) -> None:
+        try:
+            if not self.source.open():
+                self.error.emit("相机打开失败")
+                return
+            while self._is_running():
+                if self._is_paused():
+                    self.msleep(30)
+                    continue
+                ok, frame_rgb = self.source.read()
+                if not self._is_running():
+                    break
+                if not ok or frame_rgb is None:
+                    self.msleep(5)   # 相机超时, 重试
+                    continue
+                self.slot.put(frame_rgb)
+                self.preview_ready.emit(frame_rgb)
+                self.msleep(10)      # 限制最高 ~60fps, 降低 UI 压力
+        except Exception as e:
+            log.exception("CameraPreviewWorker 异常: %s", e)
+            self.error.emit(str(e))
+        finally:
+            try:
+                self.source.close()
+            except Exception:
+                pass
+
+
+class CameraInferenceWorker(QThread):
+    """相机推理线程 — 只从共享槽取最新帧推理(不碰相机), emit 检测结果。
+
+    推理仍走同一个 run_inference_runtime(合并/NMS/解码逻辑一字未改),
+    只是与显示解耦: 它尽力快地推, 推到哪帧就更新哪帧的框, 不拖慢画面。
+    """
+
+    result_ready = Signal(list, float)   # detections_unified, infer_time
+    error = Signal(str)
+    finished_clean = Signal(str)
+
+    def __init__(self, slot: _LatestFrame, parent=None) -> None:
+        super().__init__(parent)
+        self.slot = slot
+        self._running = True
+        self._paused = False
+        self._mutex = QMutex()
+        self.conf = state.conf_threshold
+        self.iou = state.iou_threshold
+        self.per_class = state.best_mode
+        self._last_seq = -1
+
+    def stop(self) -> None:
+        with QMutexLocker(self._mutex):
+            self._running = False
+
+    def set_paused(self, paused: bool) -> None:
+        with QMutexLocker(self._mutex):
+            self._paused = paused
+
+    def update_thresholds(self, conf: float, iou: float, per_class: bool | None = None) -> None:
+        with QMutexLocker(self._mutex):
+            self.conf = conf
+            self.iou = iou
+            if per_class is not None:
+                self.per_class = per_class
+
+    def _is_running(self) -> bool:
+        with QMutexLocker(self._mutex):
+            return self._running
+
+    def _is_paused(self) -> bool:
+        with QMutexLocker(self._mutex):
+            return self._paused
+
+    def run(self) -> None:
+        try:
+            while self._is_running():
+                if self._is_paused():
+                    self.msleep(30)
+                    continue
+                frame_rgb, seq = self.slot.get()
+                if frame_rgb is None or seq == self._last_seq:
+                    self.msleep(15)   # 没新帧, 等一下
+                    continue
+                self._last_seq = seq
+                try:
+                    with QMutexLocker(self._mutex):
+                        conf, iou, per_class = self.conf, self.iou, self.per_class
+                    result = run_inference_runtime(frame_rgb, conf, iou, per_class=per_class,
+                                                   drop_classes=set(state.disabled_classes))
+                    detections = _detections_to_unified(result.get("detections", []))
+                    self.result_ready.emit(detections, float(result.get("inference_time", 0.0)))
+                except Exception as e:
+                    log.error("相机推理失败: %s", e)
+                    self.msleep(30)
+        except Exception as e:
+            log.exception("CameraInferenceWorker 异常: %s", e)
+            self.error.emit(str(e))
 
 
 class FolderBatchWorker(DetectionWorker):
@@ -186,8 +364,10 @@ class FolderBatchWorker(DetectionWorker):
 
                 try:
                     with QMutexLocker(self._mutex):
-                        conf, iou = self.conf, self.iou
-                    result = run_inference_runtime(frame_rgb, conf, iou)
+                        conf, iou, per_class = self.conf, self.iou, self.per_class
+                    # 禁检类别(技术员检测项开关)在推理层就滤掉, seg mask 也不会画出
+                    result = run_inference_runtime(frame_rgb, conf, iou, per_class=per_class,
+                                                   drop_classes=set(state.disabled_classes))
                 except Exception as e:
                     log.error("批量推理失败 %s: %s", cur_file, e)
                     self.progress.emit(i + 1, self.folder_source.total)

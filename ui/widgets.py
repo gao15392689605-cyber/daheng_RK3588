@@ -256,8 +256,8 @@ class RightPanel(QWidget):
         head_lay.setContentsMargins(0, 0, 0, 0)
         head_lay.setSpacing(8)
         logo = QLabel()
-        logo.setPixmap(make_color_icon("#2DB95B", "Y", 28))
-        head_title = QLabel("YOLO检测系统")
+        logo.setPixmap(make_color_icon("#2DB95B", "异", 28))
+        head_title = QLabel("异物检测系统")
         head_title.setStyleSheet(f"color:{COLOR_TEXT}; font-size:16px; font-weight:bold;")
         head_lay.addWidget(logo); head_lay.addWidget(head_title); head_lay.addStretch()
         lay.addWidget(head)
@@ -274,9 +274,11 @@ class RightPanel(QWidget):
         lay.addWidget(self.stat_label)
 
         # 类别过滤
-        lay.addWidget(self._section_title("🎨  类别过滤"))
+        self._filter_title = self._section_title("🎨  类别过滤")
+        lay.addWidget(self._filter_title)
         self._filter_checks: dict[str, QCheckBox] = {}
         filter_area = QScrollArea()
+        self._filter_area = filter_area
         filter_area.setWidgetResizable(True)
         filter_area.setFixedHeight(120)
         filter_area.setStyleSheet(
@@ -354,6 +356,11 @@ class RightPanel(QWidget):
             f"border-bottom:1px solid {COLOR_BORDER}; padding-bottom:4px;"
         )
         return lbl
+
+    def set_filter_visible(self, visible: bool) -> None:
+        """技术员用左侧「检测项开关」控制检测, 右侧这套显示过滤就隐藏掉, 避免两套过滤混淆。"""
+        self._filter_title.setVisible(visible)
+        self._filter_area.setVisible(visible)
 
     def _on_filter_changed(self) -> None:
         enabled = {cn for cn, cb in self._filter_checks.items() if cb.isChecked()}

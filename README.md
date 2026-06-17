@@ -71,6 +71,38 @@ python main.py
 
 > 启动后 5 秒内会自动: 初始化数据库 → 加载 best.rknn → 关闭闪屏 → 弹出登录窗.
 
+### 4.3 Windows 桌面调试 (跨平台验证 · PT 模式)
+
+同一套代码内置 **PT / RKNN 双后端自动切换**: 板端找到 `best.rknn` + `rknnlite` 走 NPU,
+桌面 (Windows/无 NPU) 自动回退 **PT (PyTorch)**。用于在 Windows 上验证跨平台运行。
+
+**先决条件 (两样):**
+
+| 准备 | 放到 | 说明 |
+|------|------|------|
+| 改版灰度 `ultralytics` 源码 | `./ultralytics/` (含 `pyproject.toml`) | 模型是单通道灰度 OBB, 必须用改版源码, 标准 PyPI 版会因通道不符出错 |
+| `best.pt` 权重 | `model/best.pt` | PT 模式用 `.pt`, 不是 `.rknn` |
+
+**一键安装 (在项目根目录执行):**
+
+```bat
+python -m venv venv
+venv\Scripts\activate
+pip install -r requirements-windows.txt
+python main.py
+```
+
+`-e ./ultralytics` 会把你的改版源码装成 ultralytics 包(优先生效)并自动拉齐
+torch / numpy / opencv / Pillow 等全部依赖 (默认 **CPU 版**)。启动终端打印
+`[inference] 后端: PT  设备: CPU` 即正常。
+
+> - **GPU 加速** (有 N 卡): 装完后用本机 CUDA 版替换 CPU torch ——
+>   `pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121 --upgrade`
+>   (`cuXXX` 选 ≤ `nvidia-smi` 显示的 CUDA 版本); 成功后显示 `设备: GPU (显卡名)`。
+> - **工业相机**: gxipy 不在 PyPI, 需去大恒图像官网装 **Galaxy SDK (Windows 版)** 并勾选
+>   "Python (gxipy)" 组件; 不装则相机模式提示"相机不可用", 不影响照片/视频/文件夹检测。
+> - 可验证: UI 全流程 + 照片/视频/文件夹检测 (CPU 几秒/张属正常); 验不了: NPU 加速。
+
 ---
 
 ## 5. 启动命令速查
@@ -107,6 +139,7 @@ tobacco_detection_system/
 ├── config.py                  # 全局配置 (颜色/路径/默认参数)
 ├── requirements.txt           # 完整依赖
 ├── requirements-rk3588.txt    # RK3588 增量依赖
+├── requirements-windows.txt   # Windows 桌面调试 (PT 模式) 依赖
 ├── inference/
 │   ├── __init__.py           # monkey-patch 路径的 wrapper
 │   └── inference.py          # 复用的 PT/RKNN 双模式推理核心 (不改源)

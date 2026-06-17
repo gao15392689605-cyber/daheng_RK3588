@@ -15,10 +15,19 @@ class AppState:
     # 当前登录用户
     username: str = ""
     avatar_path: str = ""
+    role: str = "worker"        # worker / technician / admin — 登录后回填
+    shift: str = ""             # 当班班次(预留)
+    batch_id: str = ""          # 当前批次号(开批次后置, 报警/记录挂此号)
 
     # 推理参数
     conf_threshold: float = DEFAULT_CONF
     iou_threshold: float = DEFAULT_IOU
+    best_mode: bool = False     # SEG「最佳」模式: 忽略滑块, 用每类 conf
+    model_task: str = ""        # "obb" / "seg" — 加载模型后回填, 决定显示哪组预设按钮
+
+    # 相机成像参数(技术员调, 随产线配置发布给工人; 0 = 未设定, 用相机默认)
+    cam_exposure: float = 0.0   # 曝光时间 (μs)
+    cam_gain: float = 0.0       # 增益 (dB)
 
     # 模型
     model_path: str = str(DEFAULT_RKNN)
@@ -35,6 +44,8 @@ class AppState:
     current_raw_count: int = 0
     # 类别过滤集合(空集 = 全部显示)
     filter_classes: set[str] = field(default_factory=set)
+    # 禁检类别(技术员"检测项开关"关掉的类, 中文名): 这些类不检测/不计数/不报警
+    disabled_classes: set[str] = field(default_factory=set)
 
     # 当前选中行(序号)
     selected_row: int = -1

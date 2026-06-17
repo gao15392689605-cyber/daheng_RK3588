@@ -38,7 +38,7 @@ class SplashScreen(QSplashScreen):
         painter.drawText(
             pix.rect().adjusted(0, 110, 0, 0),
             Qt.AlignHCenter | Qt.AlignTop,
-            "RK3588 NPU 加速 · 10 类异物 · OBB 旋转框检测",
+            "RK3588 NPU 加速 · 10 类异物检测",
         )
         # 装饰条
         painter.fillRect(170, 180, 160, 3, QColor(COLOR_BTN_PRIMARY))

@@ -54,6 +54,8 @@ model/*.onnx
 # 如果要传, 删掉这行
 resources/fonts/*.ttc
 resources/fonts/*.ttf
+inference/assets/*.ttc
+inference/assets/*.ttf
 
 # 测试导出目录
 detection_*/

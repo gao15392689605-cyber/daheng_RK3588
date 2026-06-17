@@ -24,7 +24,29 @@ _PROJ_ROOT = Path(__file__).resolve().parent.parent
 _MODEL_DIR = _PROJ_ROOT / "model"
 _FAKE_G2 = _PROJ_ROOT / "模型权重"
 
-if not _FAKE_G2.exists() and _MODEL_DIR.exists():
+# 先清理坏/跨机符号链接: 从别的机器打包带来的 模型权重 可能指向不存在或无权限的
+# 绝对路径 (如 /root/...), 直接 .exists() 会抛 PermissionError. 用 is_symlink()(lstat,
+# 不跟随, 不会因目标无权限报错) 判断, 解析不到本地 model/ 就删掉重建.
+try:
+    if _FAKE_G2.is_symlink():
+        try:
+            _link_ok = _FAKE_G2.resolve(strict=True) == _MODEL_DIR.resolve()
+        except OSError:
+            _link_ok = False
+        if not _link_ok:
+            _FAKE_G2.unlink()
+except OSError:
+    try:
+        _FAKE_G2.unlink()
+    except OSError:
+        pass
+
+try:
+    _g2_exists = _FAKE_G2.exists()
+except OSError:
+    _g2_exists = False
+
+if not _g2_exists and _MODEL_DIR.exists():
     try:
         _FAKE_G2.symlink_to(_MODEL_DIR, target_is_directory=True)
     except (OSError, FileExistsError):
@@ -68,6 +90,7 @@ BACKEND = _core.BACKEND
 DEVICE_NAME = _core.DEVICE_NAME
 load_model = _core.load_model
 get_model = _core.get_model
+get_task = _core.get_task
 
 
 # ════════════════════════════════════════════════════════════
@@ -140,8 +163,8 @@ def _obb_nms_cv2(preds: np.ndarray, conf_th: float, iou_th: float):
     )
 
 
-def _merge_overlap_cv2(boxes, cls_ids, confs):
-    """cv2 加速版同类合并 — 用 union-find + cv2.rotatedRectangleIntersection"""
+def _merge_overlap_cv2(boxes, cls_ids, confs, axis_aligned: bool = False):
+    """cv2 加速版同类合并 — union-find. axis_aligned=False→旋转框(obb); True→轴对齐正框(seg)"""
     n_total = len(boxes)
     if n_total == 0:
         return [], [], [], []
@@ -200,8 +223,13 @@ def _merge_overlap_cv2(boxes, cls_ids, confs):
                 pts = np.concatenate(
                     [boxes[indices[ii]] for ii in grp], axis=0
                 ).astype(np.float32)
-                rect = cv2.minAreaRect(pts)
-                out_boxes.append(cv2.boxPoints(rect))
+                if axis_aligned:
+                    x1, y1 = pts[:, 0].min(), pts[:, 1].min()
+                    x2, y2 = pts[:, 0].max(), pts[:, 1].max()
+                    out_boxes.append(np.array([[x1, y1], [x2, y1], [x2, y2], [x1, y2]], np.float32))
+                else:
+                    rect = cv2.minAreaRect(pts)
+                    out_boxes.append(cv2.boxPoints(rect))
                 out_cls.append(cid)
                 out_confs.append(max(float(confs[indices[ii]]) for ii in grp))
                 out_sizes.append(len(grp))
@@ -320,16 +348,22 @@ def run_inference_runtime(
     conf_th: float,
     iou_th: float,
     skip_draw: bool = True,
+    per_class: bool = False,
+    drop_classes: set[str] | None = None,
 ) -> dict[str, Any]:
-    """运行时 conf/iou; skip_draw=True 跳过 PIL/cv2 画框, UI 自己用 ObbOverlay 渲染
+    """运行时 conf/iou; skip_draw=True 跳过 PIL/cv2 画框, UI 自己渲染.
+    per_class=True (SEG「最佳」模式): 用每类 PER_CLASS_CONF 阈值, conf_th 仅当兜底.
+    drop_classes: 技术员禁检的中文类名集合, 在画框/烤 mask 之前就整条滤掉(seg mask 也不会画出).
 
     Returns:
-        annotated_rgb 在 skip_draw=True 时是原图; detections 自带 points 字段.
+        annotated_rgb 在 skip_draw=True 时是原图(seg 会叠 mask); detections 自带 points 字段.
     """
     _core.PRESETS["__runtime__"] = {
         "conf": float(conf_th),
         "iou": float(iou_th),
         "desc": "runtime",
+        "per_class": bool(per_class),
+        "drop_classes": set(drop_classes) if drop_classes else None,
     }
     return _core.run_inference(image_rgb, mode="__runtime__", skip_draw=skip_draw)
 
